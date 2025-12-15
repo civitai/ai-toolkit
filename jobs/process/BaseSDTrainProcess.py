@@ -21,6 +21,7 @@ import torch
 import torch.backends.cuda
 from huggingface_hub import HfApi, Repository, interpreter_login
 from huggingface_hub.utils import HfFolder
+from toolkit.memory_management import MemoryManager
 
 from toolkit.basic import value_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -263,6 +264,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.current_boundary_index = 0
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
+        self._incremental_initialized = False
+        self._incremental_state = None
+        self._incremental_target_step = None
+        self._incremental_keep_state = False
+        self.pause_controller = None
+        self._training_aborted = False
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -707,6 +714,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample_step_hook(self, img_num, total_imgs):
         pass
     
+
+    def set_pause_controller(self, controller):
+        """Attach an step-budget controller used by the API server."""
+        self.pause_controller = controller
+
     def prepare_accelerator(self):
         # set some config
         self.accelerator.even_batches=False
@@ -1759,7 +1771,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
                 # we cannot merge in if quantized
-                if self.model_config.quantize:
+                if self.model_config.quantize or self.model_config.layer_offloading:
                     # todo find a way around this
                     self.network.can_merge_in = False
 
@@ -1811,6 +1823,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
                     self.network.multiplier = 1.0
+                
+                if self.network_config.layer_offloading:
+                    MemoryManager.attach(
+                        self.network,
+                        self.device_torch
+                    )
 
             if self.embed_config is not None:
                 # we are doing embedding training as well
@@ -2056,6 +2074,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
+        abort_requested = False
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -2067,6 +2086,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.train_config.do_cfg = True
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
             self.step_num = step
+            if self.pause_controller is not None:
+                if self.pause_controller.wait_if_needed(self.epoch_num, self.step_num):
+                    abort_requested = True
+                    break
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
             if self.train_config.free_u:
@@ -2149,6 +2172,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
             did_oom = False
+            loss_dict = None
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
@@ -2172,7 +2196,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
                 print_acc("################################################")
                 print_acc("")
-            self.num_consecutive_oom = 0
+            else:
+                self.num_consecutive_oom = 0
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
@@ -2191,25 +2216,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with torch.no_grad():
                 # torch.cuda.empty_cache()
                 # if optimizer has get_lrs method, then use it
-                if hasattr(optimizer, 'get_avg_learning_rate'):
-                    learning_rate = optimizer.get_avg_learning_rate()
-                elif hasattr(optimizer, 'get_learning_rates'):
-                    learning_rate = optimizer.get_learning_rates()[0]
-                elif self.train_config.optimizer.lower().startswith('dadaptation') or \
-                        self.train_config.optimizer.lower().startswith('prodigy'):
-                    learning_rate = (
-                            optimizer.param_groups[0]["d"] *
-                            optimizer.param_groups[0]["lr"]
-                    )
-                else:
-                    learning_rate = optimizer.param_groups[0]['lr']
+                if not did_oom and loss_dict is not None:
+                    if hasattr(optimizer, 'get_avg_learning_rate'):
+                        learning_rate = optimizer.get_avg_learning_rate()
+                    elif hasattr(optimizer, 'get_learning_rates'):
+                        learning_rate = optimizer.get_learning_rates()[0]
+                    elif self.train_config.optimizer.lower().startswith('dadaptation') or \
+                            self.train_config.optimizer.lower().startswith('prodigy'):
+                        learning_rate = (
+                                optimizer.param_groups[0]["d"] *
+                                optimizer.param_groups[0]["lr"]
+                        )
+                    else:
+                        learning_rate = optimizer.param_groups[0]['lr']
 
-                prog_bar_string = f"lr: {learning_rate:.1e}"
-                for key, value in loss_dict.items():
-                    prog_bar_string += f" {key}: {value:.3e}"
+                    prog_bar_string = f"lr: {learning_rate:.1e}"
+                    for key, value in loss_dict.items():
+                        prog_bar_string += f" {key}: {value:.3e}"
 
-                if self.progress_bar is not None:
-                    self.progress_bar.set_postfix_str(prog_bar_string)
+                    if self.progress_bar is not None:
+                        self.progress_bar.set_postfix_str(prog_bar_string)
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):
@@ -2220,7 +2246,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.step_num != self.start_step:
                     if is_sample_step or is_save_step:
                         self.accelerator.wait_for_everyone()
-                        
                     if is_save_step:
                         self.accelerator
                         # print above the progress bar
@@ -2313,25 +2338,51 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.grad_accumulation_step += 1
                 self.end_step_hook()
 
+                if self.pause_controller is not None:
+                    action = self.pause_controller.on_step_end(self.step_num, self.epoch_num)
+                    if action == "pause":
+                        if self.step_num < self.train_config.steps:
+                            if self.accelerator.is_main_process:
+                                self.save(self.step_num)
+                            self.accelerator.wait_for_everyone()
+                            wait_result = self.pause_controller.wait_for_resume()
+                            if wait_result == "abort":
+                                abort_requested = True
+                                break
+                            if wait_result == "complete":
+                                break
+                        else:
+                            action = "continue"
+                    if action == "abort":
+                        if self.accelerator.is_main_process:
+                            self.save(self.step_num)
+                        self.accelerator.wait_for_everyone()
+                        abort_requested = True
+                        break
+
 
         ###################################################################
         ##  END TRAIN LOOP
         ###################################################################
+        self._training_aborted = abort_requested
+        if self.pause_controller is not None:
+            self.pause_controller.notify_training_stopped(aborted=abort_requested, step=self.step_num, epoch=self.epoch_num)
         self.accelerator.wait_for_everyone()
         if self.progress_bar is not None:
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
-        if not self.train_config.disable_sampling:
+        if not self._training_aborted and not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
         print_acc("")
         if self.accelerator.is_main_process:
-            self.save()
+            if not self._training_aborted:
+                self.save()
             self.logger.finish()
         self.accelerator.end_training()
 
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and not self._training_aborted:
             # push to hub
             if self.save_config.push_to_hub:
                 if("HF_TOKEN" not in os.environ):
@@ -2491,3 +2542,211 @@ For more details, including weighting, merging and fusing LoRAs, check the [docu
 
 """
         return readme_content
+
+    def cleanup_vram(self):
+        if hasattr(self, "ema") and self.ema is not None:
+            try:
+                self.ema.to("cpu")
+            except Exception:
+                pass
+            try:
+                self.ema = None
+            except Exception:
+                pass
+
+        if hasattr(self, "modules_being_trained") and isinstance(self.modules_being_trained, list):
+            for module in self.modules_being_trained:
+                try:
+                    if hasattr(module, "to"):
+                        module.to("cpu")
+                except Exception:
+                    pass
+            try:
+                self.modules_being_trained = []
+            except Exception:
+                pass
+
+        if hasattr(self, "params"):
+            try:
+                self.params = []
+            except Exception:
+                pass
+
+        for attr in ("data_loader", "data_loader_reg", "datasets", "datasets_reg"):
+            if hasattr(self, attr):
+                try:
+                    value = getattr(self, attr)
+                    if attr.startswith("datasets") and isinstance(value, list):
+                        for dataset in value:
+                            try:
+                                if hasattr(dataset, "sd"):
+                                    dataset.sd = None
+                            except Exception:
+                                pass
+                    setattr(self, attr, None)
+                except Exception:
+                    pass
+
+        for attr in (
+            "cached_blank_embeds",
+            "cached_trigger_embeds",
+            "diff_output_preservation_embeds",
+            "unconditional_embeds",
+            "_clip_image_embeds_unconditional",
+        ):
+            if hasattr(self, attr):
+                try:
+                    setattr(self, attr, None)
+                except Exception:
+                    pass
+
+        for attr in ("taesd", "assistant_adapter", "dfe"):
+            if hasattr(self, attr):
+                try:
+                    value = getattr(self, attr)
+                    if value is not None and hasattr(value, "to"):
+                        value.to("cpu")
+                except Exception:
+                    pass
+                try:
+                    setattr(self, attr, None)
+                except Exception:
+                    pass
+
+        if hasattr(self, 'sd') and self.sd is not None:
+            try:
+                if hasattr(self.sd, 'unet') and self.sd.unet is not None:
+                    self.sd.unet.to('cpu')
+                    del self.sd.unet
+                    self.sd.unet = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'vae') and self.sd.vae is not None:
+                    self.sd.vae.to('cpu')
+                    del self.sd.vae
+                    self.sd.vae = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'text_encoder') and self.sd.text_encoder is not None:
+                    if isinstance(self.sd.text_encoder, list):
+                        for te in self.sd.text_encoder:
+                            if te is not None:
+                                te.to('cpu')
+                                del te
+                    else:
+                        self.sd.text_encoder.to('cpu')
+                        del self.sd.text_encoder
+                    self.sd.text_encoder = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'refiner_unet') and self.sd.refiner_unet is not None:
+                    self.sd.refiner_unet.to('cpu')
+                    del self.sd.refiner_unet
+                    self.sd.refiner_unet = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'network') and self.sd.network is not None:
+                    if hasattr(self.sd.network, 'to'):
+                        self.sd.network.to('cpu')
+                    del self.sd.network
+                    self.sd.network = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'adapter') and self.sd.adapter is not None:
+                    if hasattr(self.sd.adapter, 'to'):
+                        self.sd.adapter.to('cpu')
+                    del self.sd.adapter
+                    self.sd.adapter = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'decorator') and self.sd.decorator is not None:
+                    if hasattr(self.sd.decorator, 'to'):
+                        self.sd.decorator.to('cpu')
+                    del self.sd.decorator
+                    self.sd.decorator = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'assistant_lora') and self.sd.assistant_lora is not None:
+                    if hasattr(self.sd.assistant_lora, 'to'):
+                        self.sd.assistant_lora.to('cpu')
+                    del self.sd.assistant_lora
+                    self.sd.assistant_lora = None
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.sd, 'pipeline') and self.sd.pipeline is not None:
+                    del self.sd.pipeline
+                    self.sd.pipeline = None
+            except Exception:
+                pass
+
+            try:
+                del self.sd
+                self.sd = None
+            except Exception:
+                pass
+
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            try:
+                del self.optimizer
+                self.optimizer = None
+            except Exception:
+                pass
+
+        if hasattr(self, 'lr_scheduler') and self.lr_scheduler is not None:
+            try:
+                del self.lr_scheduler
+                self.lr_scheduler = None
+            except Exception:
+                pass
+
+        if hasattr(self, 'network') and self.network is not None:
+            try:
+                if hasattr(self.network, 'to'):
+                    self.network.to('cpu')
+                del self.network
+                self.network = None
+            except Exception:
+                pass
+
+        if hasattr(self, 'adapter') and self.adapter is not None:
+            try:
+                if hasattr(self.adapter, 'to'):
+                    self.adapter.to('cpu')
+                del self.adapter
+                self.adapter = None
+            except Exception:
+                pass
+
+        if hasattr(self, 'embedding') and self.embedding is not None:
+            try:
+                del self.embedding
+                self.embedding = None
+            except Exception:
+                pass
+
+        if hasattr(self, 'decorator') and self.decorator is not None:
+            try:
+                if hasattr(self.decorator, 'to'):
+                    self.decorator.to('cpu')
+                del self.decorator
+                self.decorator = None
+            except Exception:
+                pass
+
+        flush()
