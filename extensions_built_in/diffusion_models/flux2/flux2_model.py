@@ -94,6 +94,7 @@ class Flux2Model(BaseModel):
         return Flux2Params()
 
     def load_te(self):
+        te_path = self.model_config.resolve_te_path(MISTRAL_PATH)
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Mistral")
 
@@ -101,7 +102,7 @@ class Flux2Model(BaseModel):
         # tie_word_embeddings=False: the checkpoint carries both embed_tokens
         # and lm_head with different values; the config's tie claim is wrong
         text_encoder = Mistral3TextEncoder.load(
-            MISTRAL_PATH,
+            te_path,
             subfolder="",
             tie_word_embeddings=False,
             **self.component_load_kwargs("te"),
@@ -111,7 +112,7 @@ class Flux2Model(BaseModel):
         # fix_mistral_regex=False: keep the exact tokenization flux2 has always
         # used (True would change the pre-tokenizer and shift conditioning)
         tokenizer = AutoProcessor.from_pretrained(
-            MISTRAL_PATH, fix_mistral_regex=False
+            te_path, fix_mistral_regex=False
         )
         return text_encoder, tokenizer
 
