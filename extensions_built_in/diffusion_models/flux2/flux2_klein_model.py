@@ -35,16 +35,17 @@ class Flux2KleinModel(Flux2Model):
     def load_te(self):
         if self.flux2_klein_te_path is None:
             raise ValueError("flux2_klein_te_path must be set for Flux2KleinModel")
+        te_path = self.model_config.te_name_or_path or self.flux2_klein_te_path
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Qwen3")
 
         # load + quantize + offload + placement, all driven by model_config
         text_encoder = Qwen3TextEncoder.load(
-            self.flux2_klein_te_path, subfolder="", **self.component_load_kwargs("te")
+            te_path, subfolder="", **self.component_load_kwargs("te")
         )
         flush()
 
-        tokenizer = Qwen2Tokenizer.from_pretrained(self.flux2_klein_te_path)
+        tokenizer = Qwen2Tokenizer.from_pretrained(te_path)
         return text_encoder, tokenizer
 
 
