@@ -4,6 +4,7 @@ import inspect
 import json
 import random
 import shutil
+import time
 from collections import OrderedDict
 import os
 import re
@@ -385,23 +386,71 @@ class BaseSDTrainProcess(BaseTrainProcess):
             "training_info": self.get_training_info()
         })
         o_dict['ss_base_model_version'] = self.sd.get_base_model_version()
-
-        # o_dict = add_base_model_info_to_meta(
-        #     o_dict,
-        #     is_v2=self.model_config.is_v2,
-        #     is_xl=self.model_config.is_xl,
-        # )
         o_dict['ss_output_name'] = self.job.name
 
-        if self.trigger_word is not None:
-            # just so auto1111 will pick it up
-            o_dict['ss_tag_frequency'] = {
-                f"1_{self.trigger_word}": {
-                    f"{self.trigger_word}": 1
-                }
-            }
+        # Training state
+        o_dict['ss_steps'] = self.step_num
+        o_dict['ss_epoch'] = self.epoch_num
+        o_dict['ss_training_finished_at'] = time.time()
+        if hasattr(self, 'training_started_at'):
+            o_dict['ss_training_started_at'] = self.training_started_at
+
+        # Real tag frequencies from dataset captions
+        tag_freq = self._build_tag_frequency()
+        if tag_freq:
+            o_dict['ss_tag_frequency'] = tag_freq
+
+        # Dataset directory info
+        if self.data_loader is not None:
+            dataset = self.data_loader.dataset
+            datasets_list = dataset.datasets if hasattr(dataset, 'datasets') else [dataset]
+            dataset_dirs = OrderedDict()
+            for ds in datasets_list:
+                if hasattr(ds, 'dataset_config') and ds.dataset_config.folder_path:
+                    folder_name = os.path.basename(ds.dataset_config.folder_path)
+                    num_repeats = getattr(ds.dataset_config, 'num_repeats', 1)
+                    dataset_dirs[folder_name] = {
+                        "n_repeats": num_repeats,
+                        "img_count": len(ds.file_list)
+                    }
+            if dataset_dirs:
+                o_dict['ss_dataset_dirs'] = dataset_dirs
+            o_dict['ss_num_batches_per_epoch'] = len(self.data_loader)
 
         self.add_meta(o_dict)
+
+    def _build_tag_frequency(self):
+        """Build tag frequency dict from dataset captions, matching Kohya format."""
+        if self.data_loader is None:
+            # Fall back to trigger word only
+            if self.trigger_word is not None:
+                return {f"1_{self.trigger_word}": {self.trigger_word: 1}}
+            return {}
+
+        dataset = self.data_loader.dataset
+        datasets = dataset.datasets if hasattr(dataset, 'datasets') else [dataset]
+        tag_freq = OrderedDict()
+
+        for ds in datasets:
+            if hasattr(ds, 'dataset_config') and ds.dataset_config.folder_path:
+                folder_key = os.path.basename(ds.dataset_config.folder_path)
+            else:
+                folder_key = "dataset"
+
+            counts = OrderedDict()
+            for file_item in ds.file_list:
+                caption = file_item.raw_caption or ""
+                # Split by comma (standard tag separator), strip whitespace
+                tags = [t.strip() for t in caption.split(",") if t.strip()]
+                for tag in tags:
+                    counts[tag] = counts.get(tag, 0) + 1
+
+            if counts:
+                tag_freq[folder_key] = counts
+
+        if not tag_freq and self.trigger_word is not None:
+            return {f"1_{self.trigger_word}": {self.trigger_word: 1}}
+        return tag_freq
 
     def get_training_info(self):
         info = OrderedDict({
@@ -2024,6 +2073,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.last_save_step = self.step_num
         ### HOOK ###
         self.hook_before_train_loop()
+        self.training_started_at = time.time()
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
