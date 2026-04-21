@@ -125,7 +125,6 @@ def waveform_to_stereo(waveform):
         return torch.stack([fl + k * fc + k * (bl + sl), fr + k * fc + k * (br + sr)])
     return waveform.mean(0, keepdim=True).expand(2, -1)
 
-
 class CaptionMixin:
     def get_caption_item(self: 'AiToolkitDataset', index):
         if not hasattr(self, 'caption_type'):
