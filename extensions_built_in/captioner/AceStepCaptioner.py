@@ -1,4 +1,6 @@
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
+
+import gc
 
 try:
     import librosa
@@ -275,12 +277,39 @@ class AceStepCaptionConfig(CaptionConfig):
 class AceStepCaptioner(BaseCaptioner):
     caption_config_class = AceStepCaptionConfig
     caption_config: AceStepCaptionConfig
+    _model_cache: Dict[
+        Tuple[str, str, str, str, bool, str, bool], Dict[str, Any]
+    ] = {}
+    _cache_lock = threading.RLock()
+    _active_runs = 0
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super(AceStepCaptioner, self).__init__(process_id, job, config, **kwargs)
         self.separator = None
         # prep runs in worker threads; one separation on the GPU at a time
         self.separator_lock = threading.Lock()
+
+    def run(self):
+        with self._cache_lock:
+            type(self)._active_runs += 1
+        try:
+            return super().run()
+        finally:
+            with self._cache_lock:
+                type(self)._active_runs = max(0, type(self)._active_runs - 1)
+
+    def _model_cache_key(
+        self, role: str, model_path: str
+    ) -> Tuple[str, str, str, str, bool, str, bool]:
+        return (
+            role,
+            model_path,
+            self.caption_config.dtype,
+            str(self.device_torch),
+            self.caption_config.quantize,
+            self.caption_config.qtype,
+            self.caption_config.compile,
+        )
 
     def _load_thinker(self, name_or_path: str, label: str):
         """Load a Qwen2.5-Omni checkpoint and keep only its thinker."""
@@ -302,15 +331,60 @@ class AceStepCaptioner(BaseCaptioner):
             model.to("cpu")
         return model, processor
 
+    def _load_cached_thinker(self, role: str, model_path: str):
+        cache_key = self._model_cache_key(role, model_path)
+        with self._cache_lock:
+            cached = self._model_cache.get(cache_key)
+            if cached is not None:
+                self.print_and_status_update(f"Reusing {role} model")
+                model = cached["model"]
+                if not self.caption_config.low_vram and model.device == torch.device(
+                    "cpu"
+                ):
+                    model.to(self.device_torch)
+                return model, cached["processor"]
+
+            model, processor = self._load_thinker(model_path, role)
+            self._model_cache[cache_key] = {
+                "model": model,
+                "processor": processor,
+            }
+            return model, processor
+
+    @classmethod
+    def clear_model_cache(cls) -> bool:
+        with cls._cache_lock:
+            if cls._active_runs > 0:
+                return False
+            for cached in list(cls._model_cache.values()):
+                model = cached.get("model")
+                if model is not None:
+                    try:
+                        model.to("cpu")
+                    except Exception:
+                        pass
+            cls._model_cache.clear()
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        return True
+
     def load_model(self):
-        self.model, self.processor = self._load_thinker(
-            self.caption_config.model_name_or_path, "transcriber"
+        self.model, self.processor = self._load_cached_thinker(
+            "transcriber",
+            self.caption_config.model_name_or_path,
         )
         self.model2 = None
         self.processor2 = None
         if self.caption_config.fixed_caption is None:
-            self.model2, self.processor2 = self._load_thinker(
-                self.caption_config.model_name_or_path2, "captioner"
+            self.model2, self.processor2 = self._load_cached_thinker(
+                "captioner",
+                self.caption_config.model_name_or_path2,
             )
         if self.caption_config.extract_vocals_before_transcribe:
             from toolkit.audio.melbandroformer import load_melbandroformer
@@ -318,6 +392,17 @@ class AceStepCaptioner(BaseCaptioner):
             self.print_and_status_update("Loading vocal separator")
             self.separator = load_melbandroformer(device=self.device_torch)
         flush()
+
+    def cleanup_vram(self):
+        if not type(self).clear_model_cache():
+            return False
+        if self.separator is not None:
+            try:
+                self.separator.to("cpu")
+            except Exception:
+                pass
+            self.separator = None
+        return super().cleanup_vram()
 
     def maybe_compile_models(self):
         """CUDA-graph decode via a static kv cache (see Qwen3OmniCaptioner):
@@ -542,6 +627,8 @@ class AceStepCaptioner(BaseCaptioner):
         )
 
     def get_audio_caption(self, inputs, file_path: str = "") -> str:
+        if self.model2 is None or self.processor2 is None:
+            raise RuntimeError("Captioner model is not loaded")
         if self.caption_config.low_vram and self.model.device != torch.device("cpu"):
             self.model.to("cpu")
         if self.model2.device == torch.device("cpu"):
