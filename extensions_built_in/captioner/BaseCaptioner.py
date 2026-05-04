@@ -1,6 +1,7 @@
 import asyncio
 from collections import OrderedDict
 
+import gc
 import sqlite3
 import os
 from typing import Literal, Optional
@@ -254,6 +255,28 @@ class BaseCaptioner(BaseExtensionProcess):
                 block_list[i] = torch.compile(block, dynamic=True)
                 count += 1
         return count
+
+    def cleanup_vram(self):
+        for attr_name in ("model", "model2"):
+            model = getattr(self, attr_name, None)
+            if model is not None:
+                try:
+                    model.to("cpu")
+                except Exception:
+                    pass
+                setattr(self, attr_name, None)
+
+        self.processor = None
+        self.processor2 = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        return True
 
     def start_stop_watcher(self, interval_sec: float = 5.0):
         """
