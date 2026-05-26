@@ -127,8 +127,16 @@ def waveform_to_stereo(waveform):
 def video_has_audio_stream(video_path: str) -> bool:
     import torchaudio
 
-    stream_reader = torchaudio.io.StreamReader(video_path)
-    return stream_reader.default_audio_stream is not None
+    if hasattr(torchaudio, "io"):
+        stream_reader = torchaudio.io.StreamReader(video_path)
+        return stream_reader.default_audio_stream is not None
+
+    try:
+        waveform, _ = torchaudio.load(video_path, num_frames=1)
+    except Exception:
+        return False
+
+    return waveform.numel() > 0
 
 
 class CaptionMixin:
