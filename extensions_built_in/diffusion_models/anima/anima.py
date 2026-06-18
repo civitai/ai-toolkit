@@ -272,7 +272,7 @@ class AnimaModel(BaseModel):
                 torch_dtype=dtype,
             ),
             text_conditioner=AnimaTextConditioner.from_pretrained(
-                prepared_paths.diffusion_path,
+                prepared_paths.text_conditioner_path or prepared_paths.diffusion_path,
                 subfolder="text_conditioner",
                 torch_dtype=dtype,
             ),
