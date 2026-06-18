@@ -4,6 +4,7 @@ from typing import List, Optional
 import torch
 import yaml
 from safetensors.torch import load_file, save_file
+from transformers import AutoTokenizer, T5TokenizerFast
 
 from toolkit.accelerator import unwrap_model
 from toolkit.basic import flush
@@ -20,6 +21,7 @@ try:
     from diffusers import AnimaAutoBlocks, AnimaModularPipeline
     from diffusers.modular_pipelines import SequentialPipelineBlocks
     from diffusers.modular_pipelines.anima.modular_blocks_anima import AnimaCoreDenoiseStep, AnimaDecodeStep
+    from .convert_checkpoint import prepare_anima_component_paths
 except ImportError as e:
     raise ImportError(
         "Diffusers is out of date. Update diffusers to the latest version by doing pip uninstall diffusers and then pip install -r requirements.txt"
@@ -254,30 +256,39 @@ class AnimaModel(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Anima model")
 
-        pipe: AnimaModularPipeline = AnimaAutoBlocks().init_pipeline(self.model_config.name_or_path)
-        name = self.model_config.name_or_path
-        local_path = os.path.abspath(os.path.expanduser(str(name)))
-        if os.path.isdir(local_path):
-            name = local_path
+        max_shard_size = self.model_config.model_kwargs.get("max_shard_size", "5GB")
+        prepared_paths = prepare_anima_component_paths(
+            self.model_config.name_or_path,
+            self.model_config.extras_name_or_path,
+            dtype=dtype,
+            max_shard_size=max_shard_size,
+        )
 
-        # components load individually through the v2 module classes and are
-        # handed to the modular pipeline
-        from transformers import AutoTokenizer
-
+        pipe: AnimaModularPipeline = AnimaAutoBlocks().init_pipeline(
+            prepared_paths.extras_path or prepared_paths.diffusion_path
+        )
         self.print_and_status_update("Loading components")
-        transformer = CosmosTransformer3DModel.load_model(name, dtype=dtype)
-        vae = QwenImageVAE.load_model(name, dtype=dtype)
-        text_encoder = Qwen3ModelEncoder.load_model(name, dtype=dtype)
-        text_conditioner = AnimaTextConditioner.load_model(name, dtype=dtype)
-        tokenizer = AutoTokenizer.from_pretrained(name, subfolder="tokenizer")
-        t5_tokenizer = AutoTokenizer.from_pretrained(name, subfolder="t5_tokenizer")
         pipe.update_components(
-            transformer=transformer,
-            vae=vae,
-            text_encoder=text_encoder,
-            text_conditioner=text_conditioner,
-            tokenizer=tokenizer,
-            t5_tokenizer=t5_tokenizer,
+            transformer=CosmosTransformer3DModel.load_model(
+                prepared_paths.diffusion_path, dtype=dtype
+            ),
+            text_conditioner=AnimaTextConditioner.load_model(
+                prepared_paths.diffusion_path, dtype=dtype
+            ),
+            text_encoder=Qwen3ModelEncoder.load_model(
+                prepared_paths.extras_path, dtype=dtype
+            ),
+            tokenizer=AutoTokenizer.from_pretrained(
+                prepared_paths.extras_path,
+                subfolder="tokenizer",
+            ),
+            t5_tokenizer=T5TokenizerFast.from_pretrained(
+                prepared_paths.extras_path,
+                subfolder="t5_tokenizer",
+            ),
+            vae=QwenImageVAE.load_model(
+                prepared_paths.extras_path, dtype=dtype
+            ),
             scheduler=self.get_train_scheduler(),
         )
 
