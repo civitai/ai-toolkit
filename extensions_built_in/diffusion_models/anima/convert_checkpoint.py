@@ -19,6 +19,7 @@ class PreparedAnimaPaths:
     diffusion_path: str
     extras_path: str
     converted_diffusion: bool
+    text_conditioner_path: str | None = None
 
 
 COSMOS_2_T2I_CONFIG = {
@@ -98,6 +99,11 @@ def has_anima_diffusion_components(path: str) -> bool:
     )
 
 
+def has_anima_text_conditioner(path: str) -> bool:
+    root = Path(path).expanduser()
+    return root.is_dir() and (root / "text_conditioner" / "config.json").is_file()
+
+
 def _checkpoint_cache_dir(checkpoint_path: str) -> Path:
     checkpoint = Path(checkpoint_path).expanduser().resolve()
     stat = checkpoint.stat()
@@ -147,16 +153,20 @@ def split_anima_checkpoint(
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     transformer_state_dict = {}
     text_conditioner_state_dict = {}
-    adapter_prefix = "net.llm_adapter."
+    adapter_prefixes = (
+        "net.llm_adapter.",
+        "model.diffusion_model.llm_adapter.",
+        "diffusion_model.llm_adapter.",
+    )
 
     for key, value in state_dict.items():
-        if key.startswith(adapter_prefix):
-            text_conditioner_state_dict[key.removeprefix(adapter_prefix)] = value
+        for adapter_prefix in adapter_prefixes:
+            if key.startswith(adapter_prefix):
+                text_conditioner_state_dict[key.removeprefix(adapter_prefix)] = value
+                break
         else:
             transformer_state_dict[key] = value
 
-    if not text_conditioner_state_dict:
-        raise ValueError("Anima checkpoint does not contain net.llm_adapter.* text conditioner weights")
     return transformer_state_dict, text_conditioner_state_dict
 
 
@@ -166,7 +176,11 @@ def convert_cosmos_2_transformer(state_dict: dict[str, torch.Tensor]) -> CosmosT
 
     converted = {}
     for key, value in state_dict.items():
-        new_key = key.removeprefix("net.")
+        new_key = key
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "net."):
+            if new_key.startswith(prefix):
+                new_key = new_key.removeprefix(prefix)
+                break
         for old, new in COSMOS_2_RENAMES.items():
             new_key = new_key.replace(old, new)
         if not any(drop_key in new_key for drop_key in COSMOS_2_DROP_KEYS):
@@ -223,11 +237,17 @@ def convert_anima_checkpoint(
         safe_serialization=True,
         max_shard_size=max_shard_size,
     )
-    convert_text_conditioner(text_conditioner_state_dict).to(dtype=dtype).save_pretrained(
-        output / "text_conditioner",
-        safe_serialization=True,
-        max_shard_size=max_shard_size,
-    )
+    if text_conditioner_state_dict:
+        convert_text_conditioner(text_conditioner_state_dict).to(dtype=dtype).save_pretrained(
+            output / "text_conditioner",
+            safe_serialization=True,
+            max_shard_size=max_shard_size,
+        )
+    else:
+        print(
+            "Anima checkpoint does not contain text conditioner weights; "
+            "loading text_conditioner from extras_name_or_path"
+        )
     return str(output)
 
 
@@ -251,6 +271,10 @@ def prepare_anima_component_paths(
     if not Path(model_path).exists() and not model_path.endswith(".safetensors"):
         return PreparedAnimaPaths(model_path, extras_name_or_path, False)
 
+    extras_path = extras_name_or_path
+    if not extras_path or extras_path == name_or_path:
+        extras_path = DEFAULT_ANIMA_EXTRAS_REPO
+
     checkpoint_path = _resolve_checkpoint(model_path)
     output_path = _checkpoint_cache_dir(checkpoint_path)
     print(f"Converting Anima checkpoint to Diffusers transformer components: {checkpoint_path} -> {output_path}")
@@ -261,7 +285,5 @@ def prepare_anima_component_paths(
         max_shard_size=max_shard_size,
     )
 
-    extras_path = extras_name_or_path
-    if not extras_path or extras_path == name_or_path:
-        extras_path = DEFAULT_ANIMA_EXTRAS_REPO
-    return PreparedAnimaPaths(converted_path, extras_path, True)
+    text_conditioner_path = converted_path if has_anima_text_conditioner(converted_path) else extras_path
+    return PreparedAnimaPaths(converted_path, extras_path, True, text_conditioner_path)
