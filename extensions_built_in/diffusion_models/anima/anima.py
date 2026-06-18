@@ -5,6 +5,7 @@ import torch
 import yaml
 from optimum.quanto import freeze
 from safetensors.torch import load_file, save_file
+from transformers import AutoTokenizer, Qwen3Model, T5TokenizerFast
 
 from toolkit.accelerator import unwrap_model
 from toolkit.basic import flush
@@ -16,10 +17,11 @@ from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscre
 from toolkit.util.quantize import get_qtype, quantize, quantize_model
 
 try:
-    from diffusers import AnimaAutoBlocks, AnimaModularPipeline, AnimaTextConditioner
+    from diffusers import AnimaAutoBlocks, AnimaModularPipeline, AnimaTextConditioner, AutoencoderKLQwenImage
     from diffusers.models import CosmosTransformer3DModel
     from diffusers.modular_pipelines import SequentialPipelineBlocks
     from diffusers.modular_pipelines.anima.modular_blocks_anima import AnimaCoreDenoiseStep, AnimaDecodeStep
+    from .convert_checkpoint import prepare_anima_component_paths
 except ImportError as e:
     raise ImportError(
         "Diffusers is out of date. Update diffusers to the latest version by doing pip uninstall diffusers and then pip install -r requirements.txt"
@@ -254,12 +256,45 @@ class AnimaModel(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Anima model")
 
-        pipe: AnimaModularPipeline = AnimaAutoBlocks().init_pipeline(self.model_config.name_or_path)
-        load_kwargs = {"torch_dtype": dtype}
-        model_path = os.path.abspath(os.path.expanduser(str(self.model_config.name_or_path)))
-        if os.path.isdir(model_path):
-            load_kwargs["pretrained_model_name_or_path"] = model_path
-        pipe.load_components(**load_kwargs)
+        max_shard_size = self.model_config.model_kwargs.get("max_shard_size", "5GB")
+        prepared_paths = prepare_anima_component_paths(
+            self.model_config.name_or_path,
+            self.model_config.extras_name_or_path,
+            dtype=dtype,
+            max_shard_size=max_shard_size,
+        )
+
+        pipe: AnimaModularPipeline = AnimaAutoBlocks().init_pipeline()
+        pipe.update_components(
+            transformer=CosmosTransformer3DModel.from_pretrained(
+                prepared_paths.diffusion_path,
+                subfolder="transformer",
+                torch_dtype=dtype,
+            ),
+            text_conditioner=AnimaTextConditioner.from_pretrained(
+                prepared_paths.diffusion_path,
+                subfolder="text_conditioner",
+                torch_dtype=dtype,
+            ),
+            text_encoder=Qwen3Model.from_pretrained(
+                prepared_paths.extras_path,
+                subfolder="text_encoder",
+                torch_dtype=dtype,
+            ),
+            tokenizer=AutoTokenizer.from_pretrained(
+                prepared_paths.extras_path,
+                subfolder="tokenizer",
+            ),
+            t5_tokenizer=T5TokenizerFast.from_pretrained(
+                prepared_paths.extras_path,
+                subfolder="t5_tokenizer",
+            ),
+            vae=AutoencoderKLQwenImage.from_pretrained(
+                prepared_paths.extras_path,
+                subfolder="vae",
+                torch_dtype=dtype,
+            ),
+        )
         pipe.update_components(scheduler=self.get_train_scheduler())
 
         transformer = pipe.transformer
