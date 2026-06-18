@@ -160,6 +160,90 @@ curl -X POST http://localhost:8000/sessions/sdxl-lora-demo/steps \
 curl -s -N http://localhost:8000/sessions/sdxl-lora-demo/logs/stream
 ```
 
+## Anima checkpoint training
+
+Use `model.name_or_path` for the local Anima diffusion checkpoint `.safetensors` file and `model.extras_name_or_path` for the Diffusers base repo that provides tokenizer, text encoder, VAE, and other non-checkpoint components.
+
+```bash
+curl -X POST http://localhost:8000/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "anima-checkpoint-fruit",
+    "maxSteps": 2,
+    "config": {
+      "job": "extension",
+      "config": {
+        "name": "anima-checkpoint-fruit",
+        "process": [
+          {
+            "type": "diffusion_trainer",
+            "training_folder": "/home/user/Dev/ai-toolkit/output/anima-checkpoint-fruit",
+            "device": "cuda",
+            "network": {
+              "type": "lora",
+              "linear": 16,
+              "linear_alpha": 16
+            },
+            "save": {
+              "dtype": "bf16",
+              "save_every": 100,
+              "save_format": "diffusers",
+              "push_to_hub": false
+            },
+            "datasets": [
+              {
+                "folder_path": "/home/user/Dev/ai-toolkit/datasets/fruit",
+                "caption_ext": "txt",
+                "resolution": [512],
+                "cache_latents_to_disk": false,
+                "flip_x": true
+              }
+            ],
+            "train": {
+              "batch_size": 1,
+              "steps": 2,
+              "gradient_accumulation": 1,
+              "train_unet": true,
+              "train_text_encoder": false,
+              "gradient_checkpointing": true,
+              "noise_scheduler": "flowmatch",
+              "optimizer": "adamw8bit",
+              "lr": 0.00002,
+              "dtype": "bf16",
+              "mixed_precision": "bf16",
+              "cache_text_encoder_outputs": true,
+              "cache_text_encoder_outputs_to_disk": false,
+              "skip_first_sample": true,
+              "disable_sampling": true
+            },
+            "model": {
+              "arch": "anima",
+              "name_or_path": "/work/models/anima-preview3-base.safetensors",
+              "extras_name_or_path": "circlestone-labs/Anima-Base-v1.0-Diffusers",
+              "low_vram": false
+            },
+            "sample": {
+              "sampler": "flowmatch",
+              "sample_every": 0,
+              "width": 512,
+              "height": 512,
+              "guidance_scale": 4.5,
+              "sample_steps": 30,
+              "samples": [
+                { "prompt": "masterpiece, best quality, safe, a basket of fruit on a table" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }'
+
+curl -X POST http://localhost:8000/sessions/anima-checkpoint-fruit/steps \
+  -H "Content-Type: application/json" \
+  -d '{ "steps": 2 }'
+```
+
 ## 5. Abort the session
 
 ```bash
