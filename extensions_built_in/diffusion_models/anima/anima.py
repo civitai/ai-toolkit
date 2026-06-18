@@ -273,7 +273,8 @@ class AnimaModel(BaseModel):
                 prepared_paths.diffusion_path, dtype=dtype
             ),
             text_conditioner=AnimaTextConditioner.load_model(
-                prepared_paths.diffusion_path, dtype=dtype
+                prepared_paths.text_conditioner_path or prepared_paths.diffusion_path,
+                dtype=dtype,
             ),
             text_encoder=Qwen3ModelEncoder.load_model(
                 prepared_paths.extras_path, dtype=dtype
