@@ -6,7 +6,7 @@ from io import BytesIO
 
 from fastapi import Body, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from PIL import Image
 
 from api_server.audio_caption import DEFAULT_AUDIO_MODEL_ID, DEFAULT_AUDIO_PROMPT, AudioCaptioner
@@ -33,12 +33,11 @@ ACE_STEP_AUDIO_EXTENSIONS = ["mp3", "wav", "flac", "ogg"]
 
 
 class SessionCreateRequest(BaseModel):
+    model_config = ConfigDict(validate_by_name=True)
+
     session_id: Optional[str] = Field(default=None, alias='sessionId')
     max_steps: Optional[int] = Field(default=None, alias='maxSteps')
     config: Dict[str, Any]
-
-    class Config:
-        allow_population_by_field_name = True
 
 
 class AllocateStepsRequest(BaseModel):
