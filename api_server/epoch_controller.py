@@ -67,7 +67,6 @@ class StepBudgetController:
 
     def on_step_end(self, step: int, epoch: int) -> str:
         """Called after each training step. Returns 'pause', 'continue', or 'abort'."""
-        callback: Optional[Callable[[int, int], None]] = None
         should_pause = False
         last_step_index = step - 1 if step > 0 else None
         with self._lock:
@@ -82,21 +81,30 @@ class StepBudgetController:
                 should_pause = True
             elif self.completed_steps >= allowed:
                 should_pause = True
-            if should_pause:
-                self.pause_event.set()
-                if self.on_budget_exhausted is not None and self._budget_notified_at != self.completed_steps:
-                    self._budget_notified_at = self.completed_steps
-                    callback = self.on_budget_exhausted
-            else:
+            if not should_pause:
                 self.pause_event.clear()
-        if callback is not None:
-            try:
-                callback(self.completed_steps, epoch)
-            except Exception:
-                pass
         if self.abort_event.is_set():
             return "abort"
         return "pause" if should_pause else "continue"
+
+    def notify_checkpoint_saved(self, step: int, epoch: int) -> None:
+        """Publish a budget pause after its checkpoint has been fully saved."""
+        callback: Optional[Callable[[int, int], None]] = None
+        with self._lock:
+            if step != self.completed_steps:
+                raise ValueError(
+                    f"checkpoint step {step} does not match completed step {self.completed_steps}"
+                )
+            self._last_epoch = epoch
+            self.pause_event.set()
+            if self.on_budget_exhausted is not None and self._budget_notified_at != step:
+                self._budget_notified_at = step
+                callback = self.on_budget_exhausted
+        if callback is not None:
+            try:
+                callback(step, epoch)
+            except Exception:
+                pass
 
     def wait_for_resume(self) -> str:
         """Wait for additional budget or abort. Returns 'resume', 'abort', or 'complete'."""
