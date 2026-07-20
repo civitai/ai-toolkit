@@ -508,7 +508,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         step_num = ''
         if step is not None:
-            self.last_save_step = step
             # zeropad 9 digits
             step_num = f"_{str(step).zfill(9)}"
 
@@ -712,6 +711,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
         flush()
+        if step is not None:
+            self.last_save_step = step
 
     # Called before the model is loaded
     def hook_before_model_load(self):
@@ -2387,7 +2388,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # if is even step and we have a reg dataset, use that
                 # todo improve this logic to send one of each through if we can buckets and batch size might be an issue
                 is_reg_step = False
-                is_save_step = self.save_config.save_every and self.step_num % self.save_config.save_every == 0
+                is_save_step = (
+                    self.save_config.save_every
+                    and self.step_num % self.save_config.save_every == 0
+                    and self.step_num != self.last_save_step
+                )
                 is_sample_step = (
                     self.sample_config.sample_every
                     and self.step_num >= self.sample_config.sample_start_step
@@ -2648,18 +2653,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.pause_controller is not None:
                     action = self.pause_controller.on_step_end(self.step_num, self.epoch_num)
                     if action == "pause":
-                        if self.step_num < self.train_config.steps:
-                            if self.accelerator.is_main_process:
-                                self.save(self.step_num)
-                            self.accelerator.wait_for_everyone()
-                            wait_result = self.pause_controller.wait_for_resume()
-                            if wait_result == "abort":
-                                abort_requested = True
-                                break
-                            if wait_result == "complete":
-                                break
-                        else:
-                            action = "continue"
+                        if self.accelerator.is_main_process:
+                            self.save(self.step_num)
+                        self.accelerator.wait_for_everyone()
+                        self.pause_controller.notify_checkpoint_saved(self.step_num, self.epoch_num)
+                        if self.step_num >= self.train_config.steps:
+                            break
+                        wait_result = self.pause_controller.wait_for_resume()
+                        if wait_result == "abort":
+                            abort_requested = True
+                            break
+                        if wait_result == "complete":
+                            break
                     if action == "abort":
                         if self.accelerator.is_main_process:
                             self.save(self.step_num)
@@ -2672,15 +2677,29 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ##  END TRAIN LOOP
         ###################################################################
         self._training_aborted = abort_requested
-        if self.pause_controller is not None:
-            self.pause_controller.notify_training_stopped(aborted=abort_requested, step=self.step_num, epoch=self.epoch_num)
         self.accelerator.wait_for_everyone()
         if self.progress_bar is not None:
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
+
+        saved_final_checkpoint = False
         if self.accelerator.is_main_process and not self._training_aborted:
-            self.save()
+            if self.pause_controller is None:
+                self.save()
+            elif self.last_save_step != self.step_num:
+                self.save(self.step_num)
+                saved_final_checkpoint = True
+        self.accelerator.wait_for_everyone()
+
+        if self.pause_controller is not None:
+            if saved_final_checkpoint:
+                self.pause_controller.notify_checkpoint_saved(self.step_num, self.epoch_num)
+            self.pause_controller.notify_training_stopped(
+                aborted=abort_requested,
+                step=self.step_num,
+                epoch=self.epoch_num,
+            )
         if not self._training_aborted and not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
