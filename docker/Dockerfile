@@ -1,9 +1,11 @@
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+ARG PYTORCH_VERSION=2.9.1
 
 LABEL authors="jaret"
 
 # Set noninteractive to avoid timezone prompts
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTORCH_VERSION=${PYTORCH_VERSION}
 
 # ref https://en.wikipedia.org/wiki/CUDA
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0"
@@ -49,7 +51,7 @@ WORKDIR /app
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
 # install pytorch before cache bust to avoid redownloading pytorch
-RUN pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
+RUN pip install --no-cache-dir torch==${PYTORCH_VERSION} torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
 
 WORKDIR /app/ai-toolkit
 
