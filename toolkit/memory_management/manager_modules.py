@@ -670,6 +670,78 @@ class LinearLayerMemoryManager(BaseLayerMemoryManager):
         self.module._memory_management_device = self.manager.process_device
 
 
+@torch.compiler.disable
+def _stage_ostris_layer(module: nn.Module, device: torch.device):
+    cpu_bufs = {
+        name: buffer
+        for name, buffer in module._buffers.items()
+        if buffer is not None and buffer.device.type == "cpu"
+    }
+    bias = module._parameters.get("bias", None)
+    bias_cpu = (
+        bias.data
+        if bias is not None and bias.data.device.type == "cpu"
+        else None
+    )
+
+    restore_stack = getattr(module, "_memory_management_restore_stack", None)
+    if restore_stack is None:
+        restore_stack = []
+        module._memory_management_restore_stack = restore_stack
+
+    if device.type != "cuda" or (not cpu_bufs and bias_cpu is None):
+        restore_stack.append(None)
+        return
+
+    state = _get_device_state(device)
+    depth = state["depth"]
+    index = state["forward_clk"]
+    state["forward_clk"] = (index + 1) % depth
+    transfer_stream = state["transfer_stream"]
+
+    with torch.cuda.device(device):
+        with torch.cuda.stream(transfer_stream):
+            transfer_stream.wait_event(state["fwd_slot_free"][index])
+            gpu_bufs = {
+                name: buffer.to(device, non_blocking=True)
+                for name, buffer in cpu_bufs.items()
+            }
+            gpu_bias = (
+                bias_cpu.to(device, non_blocking=True)
+                if bias_cpu is not None
+                else None
+            )
+            state["w_buffers"][index] = gpu_bufs
+            state["b_buffers"][index] = gpu_bias
+            state["fwd_slot_ready"][index].record()
+        torch.cuda.current_stream().wait_event(state["fwd_slot_ready"][index])
+
+        for name, buffer in gpu_bufs.items():
+            module._buffers[name] = buffer
+        if gpu_bias is not None:
+            bias.data = gpu_bias
+
+    restore_stack.append((cpu_bufs, bias_cpu, state, index))
+
+
+@torch.compiler.disable
+def _restore_ostris_layer(module: nn.Module, device: torch.device):
+    restore_stack = module._memory_management_restore_stack
+    restore_state = restore_stack.pop()
+    if restore_state is None:
+        return
+
+    cpu_bufs, bias_cpu, state, index = restore_state
+    bias = module._parameters.get("bias", None)
+
+    with torch.cuda.device(device):
+        for name, buffer in cpu_bufs.items():
+            module._buffers[name] = buffer
+        if bias_cpu is not None:
+            bias.data = bias_cpu
+        _release_forward_slot(state, index)
+
+
 class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
     """Offload manager for OstrisLinear (custom-quantized) layers.
 
@@ -721,64 +793,14 @@ class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
 
             module = self.module
             device = self.manager.process_device
-            if device.type != "cuda":
+            _stage_ostris_layer(module, device)
+            try:
+                if device.type == "cuda":
+                    with torch.cuda.device(device):
+                        return self._original_forward(x)
                 return self._original_forward(x)
-
-            cpu_bufs = {
-                n: b
-                for n, b in module._buffers.items()
-                if b is not None and b.device.type == "cpu"
-            }
-            bias = module._parameters.get("bias", None)
-            bias_cpu = (
-                bias.data
-                if bias is not None and bias.data.device.type == "cpu"
-                else None
-            )
-            if not cpu_bufs and bias_cpu is None:
-                # already resident on device
-                return self._original_forward(x)
-
-            state = _get_device_state(device)
-            d = state["depth"]
-            idx = state["forward_clk"]
-            state["forward_clk"] = (idx + 1) % d
-            ts = state["transfer_stream"]
-            # the guard makes current_stream() resolve to the process device and
-            # keeps that device's context active for the quantizer's triton
-            # kernels (nothing sets the global current device, so it is 0 even
-            # when training on another gpu)
-            with torch.cuda.device(device):
-                with torch.cuda.stream(ts):
-                    ts.wait_event(state["fwd_slot_free"][idx])
-                    gpu_bufs = {
-                        n: b.to(device, non_blocking=True) for n, b in cpu_bufs.items()
-                    }
-                    gpu_bias = (
-                        bias_cpu.to(device, non_blocking=True)
-                        if bias_cpu is not None
-                        else None
-                    )
-                    state["w_buffers"][idx] = gpu_bufs
-                    state["b_buffers"][idx] = gpu_bias
-                    state["fwd_slot_ready"][idx].record()
-                torch.cuda.current_stream().wait_event(state["fwd_slot_ready"][idx])
-
-                # swap the quantized state onto the device, run the quantizer's own
-                # forward, then swap the pinned CPU state back
-                for n, t in gpu_bufs.items():
-                    module._buffers[n] = t
-                if gpu_bias is not None:
-                    bias.data = gpu_bias
-                try:
-                    out = self._original_forward(x)
-                finally:
-                    for n, t in cpu_bufs.items():
-                        module._buffers[n] = t
-                    if bias_cpu is not None:
-                        bias.data = bias_cpu
-                _release_forward_slot(state, idx)
-            return out
+            finally:
+                _restore_ostris_layer(module, device)
 
         if hasattr(self.module, "ara_lora_ref"):
             self.module.ara_lora_ref().org_forward = _mm_forward
