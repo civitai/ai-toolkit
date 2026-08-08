@@ -24,7 +24,9 @@ downloaded from the hub into ``MODELS_PATH`` when missing. Individual files
 can be overridden via ``model_kwargs``: ``dit_<partition>_path``,
 ``text_encoder_path``, ``video_vae_path``, ``audio_vae_path``;
 ``model_kwargs.partition`` picks ``fl2va``, ``fl2va_pruned`` (default),
-``ref2va``, or ``ref2va_pruned``.
+``ref2va``, or ``ref2va_pruned``. When ``name_or_path`` is a local directory,
+tokenizer, processor, and text-encoder metadata load from its ``FL2VA``
+subdirectory so fully packed repositories work without hub access.
 
 Conventions bridged to ai-toolkit:
   - the model consumes t = 1 - sigma in [0, 1] (t=1 clean) and predicts the
@@ -269,6 +271,19 @@ class MinimaxH3Model(BaseModel):
             repo_id=repo_id, filename=rel_path, local_dir=MODELS_PATH
         )
 
+    def _resolve_original_component(self, component: str):
+        """Resolve original-repository metadata locally when the packed model
+        path is available, otherwise retain the public hub default."""
+        name_or_path = self.model_config.name_or_path
+        if name_or_path and os.path.isdir(name_or_path):
+            component_path = os.path.join(name_or_path, "FL2VA", component)
+            if not os.path.isdir(component_path):
+                raise FileNotFoundError(
+                    f"MiniMax-H3 metadata directory is missing: {component_path}"
+                )
+            return component_path, {}
+        return ORIGINAL_REPO, {"subfolder": f"FL2VA/{component}"}
+
     def _dit_component(self) -> str:
         partition = str(
             self.model_config.model_kwargs.get("partition", "fl2va_pruned")
@@ -435,12 +450,14 @@ class MinimaxH3Model(BaseModel):
             Qwen3VLForConditionalGeneration,
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            ORIGINAL_REPO, subfolder="FL2VA/tokenizer"
+        tokenizer_path, tokenizer_kwargs = self._resolve_original_component(
+            "tokenizer"
         )
-        processor = AutoProcessor.from_pretrained(
-            ORIGINAL_REPO, subfolder="FL2VA/processor"
+        processor_path, processor_kwargs = self._resolve_original_component(
+            "processor"
         )
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
+        processor = AutoProcessor.from_pretrained(processor_path, **processor_kwargs)
 
         te_path = self.model_config.te_name_or_path
         if te_path is not None and os.path.isdir(te_path):
@@ -463,9 +480,10 @@ class MinimaxH3Model(BaseModel):
             )
             # single-file ComfyUI checkpoint: 50 decoder layers, no final norm,
             # no lm_head; LM linears nvfp4 (AWQ), embeddings int8, vision bf16
-            config = AutoConfig.from_pretrained(
-                ORIGINAL_REPO, subfolder="FL2VA/text_encoder"
+            config_path, config_kwargs = self._resolve_original_component(
+                "text_encoder"
             )
+            config = AutoConfig.from_pretrained(config_path, **config_kwargs)
             # only hidden_states[50] is consumed: truncate the decoder stack to
             # 50 layers; the final norm is neutralized below so
             # hidden_states[-1] stays the unnormalized layer-49 output
