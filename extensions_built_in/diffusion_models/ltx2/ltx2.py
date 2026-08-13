@@ -1,6 +1,8 @@
 from functools import partial
+import hashlib
 import json
 import os
+import tempfile
 from typing import List, Optional
 
 import torch
@@ -1414,12 +1416,24 @@ class LTX25Model(LTX2Model):
         num_quantized = self._load_quantized_module(text_encoder, te_sd, "text encoder")
         return text_encoder, num_quantized
 
+    def _gemma4_assets_dir(self, te_path: str) -> str:
+        sidecar = os.path.splitext(te_path)[0] + "_hf_assets"
+        if os.access(os.path.dirname(te_path) or ".", os.W_OK):
+            return sidecar
+        # worker fleets mount the checkpoint repo read-only, so keep the
+        # extraction keyed by checkpoint path in a cache we can write to
+        root = os.environ.get("HF_HOME") or tempfile.gettempdir()
+        key = hashlib.sha256(os.path.abspath(te_path).encode()).hexdigest()[:16]
+        return os.path.join(
+            root, "aitk_ltx25_assets", f"{os.path.basename(sidecar)}-{key}"
+        )
+
     def _load_gemma4_tokenizer(self, te_path: str, te_state_dict: dict):
         """The comfy file embeds the tokenizer and its configs as uint8
-        tensors; extract them next to the file once and load from there."""
+        tensors; extract them once and load from there."""
         from transformers import AutoTokenizer
 
-        assets_dir = os.path.splitext(te_path)[0] + "_hf_assets"
+        assets_dir = self._gemma4_assets_dir(te_path)
         assets = {
             "tokenizer.json": "tokenizer_json",
             "tokenizer_config.json": "hf_asset__tokenizer_config.json",
@@ -1431,8 +1445,12 @@ class LTX25Model(LTX2Model):
             blob = te_state_dict.get(tensor_key, None)
             if blob is None or os.path.exists(out_path):
                 continue
-            with open(out_path, "wb") as f:
+            # one container per GPU shares this cache; publish atomically so a
+            # peer never loads a half-written tokenizer
+            tmp_path = f"{out_path}.{os.getpid()}.tmp"
+            with open(tmp_path, "wb") as f:
                 f.write(bytes(blob.cpu().numpy().tobytes()))
+            os.replace(tmp_path, out_path)
         # the embedded tokenizer.json has an empty post-processor (ComfyUI
         # prepends BOS in its own wrapper); restore the standard Gemma
         # behavior so blank prompts still yield a token
