@@ -605,7 +605,7 @@ Notes:
 
 # Tagging API
 
-The API server supports CL Tagger v2 inference. The default and only built-in model is `cl-tagger.v2` (`cella110n/cl_tagger_v2`, stable `v2_00` weights).
+The API server supports both WD14 and CL Tagger v2 inference. WD14 (`wd14-vit.v1`) remains the built-in default; provide an extracted CL Tagger v2 model through `model_path` to use the newer tagger.
 
 ## Tagging Examples
 
@@ -633,7 +633,7 @@ curl -X POST http://localhost:8000/tag \
   }'
 ```
 
-### Tag using a local model directory
+### Tag using a local CL Tagger v2 directory
 
 ```bash
 curl -X POST http://localhost:8000/tag \
@@ -720,19 +720,20 @@ curl -X GET http://localhost:8000/tag/free
 | `media_type` | string | inferred | `"image"` or `"video"`; inferred from file extension when omitted |
 | `frame_interval` | float | 0.25 | Video frame sampling interval in seconds |
 | `max_frame_count` | integer | 50 | Max frames sampled from a video |
-| `general_threshold` | float | 0.55 | Minimum confidence for general tags |
-| `character_threshold` | float | 0.55 | Minimum confidence for character tags |
+| `general_threshold` | float | model-specific | Minimum confidence for general tags; defaults to 0.35 for WD14 and 0.55 for CL Tagger v2 |
+| `character_threshold` | float | model-specific | Minimum confidence for character tags; defaults to 0.85 for WD14 and 0.55 for CL Tagger v2 |
 
 ### Request Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `model_path` | string | null | Extracted CL Tagger repository root (containing `v2_00/`) or a directory containing `model.onnx`, `model.onnx.data`, and `model_vocabulary.json` |
+| `model_path` | string | null | Extracted WD14 directory containing `model.onnx` and `selected_tags.csv`, or CL Tagger repository root containing `v2_00/` with its ONNX model, external data, and vocabulary |
 
 ### Notes
 
 - `input` must be a list; items can be a string path or a dict with overrides.
 - Provide either `media_path` or `media_url`, not both.
-- When `model_path` is provided, the server loads from that location instead of downloading.
+- When `model_path` is provided, the server loads from that location instead of downloading and auto-detects the model from its input layout and label format.
+- When thresholds are omitted, each model uses its own defaults so existing WD14 behavior is preserved.
 - Video inference is supported for `.mp4`, `.webm`, `.gifv`, and `.gif` files.
 - Responses retain the existing `result` object and include `rating`, `tags`, and `characters` for each input.
