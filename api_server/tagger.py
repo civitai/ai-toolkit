@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import os.path
@@ -8,18 +9,23 @@ from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 import cv2
 import numpy as np
 import onnxruntime as rt  # type: ignore
-import pandas as pd
 import torch
 from PIL import Image
 
-from api_server.tagging_models import get_model_and_labels
+from api_server.tagging_models import (
+    MODEL_DATA_FILENAME,
+    MODEL_FILENAME,
+    MODEL_ID,
+    MODEL_SUBDIRECTORY,
+    VOCABULARY_FILENAME,
+    get_model_and_labels,
+)
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "wd14-vit.v1"
-
 SUPPORTED_VIDEO_FORMATS = [".mp4", ".webm", ".gifv", ".gif"]
 NANOS_PER_MS = 1_000_000
+DEFAULT_TAG_THRESHOLD = 0.55
 
 
 class MediaType(str, Enum):
@@ -37,8 +43,8 @@ class PredictionRequest:
         self,
         media_path: str,
         media_type: MediaType,
-        general_threshold: float = 0.35,
-        character_threshold: float = 0.85,
+        general_threshold: float = DEFAULT_TAG_THRESHOLD,
+        character_threshold: float = DEFAULT_TAG_THRESHOLD,
     ):
         self.media_path = media_path
         self.media_type = media_type
@@ -52,8 +58,8 @@ class PredictionRequest:
         media_type: Optional[MediaType] = None,
         frame_interval: float = 0.25,
         max_frame_count: int = 50,
-        general_threshold: float = 0.35,
-        character_threshold: float = 0.85,
+        general_threshold: float = DEFAULT_TAG_THRESHOLD,
+        character_threshold: float = DEFAULT_TAG_THRESHOLD,
     ):
         if media_type is None:
             _, ext = os.path.splitext(media_path)
@@ -78,8 +84,8 @@ class PredictionRequest:
             MediaType(data["media_type"]) if "media_type" in data else None,
             data.get("frame_interval", 0.25),
             data.get("max_frame_count", 50),
-            data.get("general_threshold", 0.35),
-            data.get("character_threshold", 0.85),
+            data.get("general_threshold", DEFAULT_TAG_THRESHOLD),
+            data.get("character_threshold", DEFAULT_TAG_THRESHOLD),
         )
 
 
@@ -89,8 +95,8 @@ class VideoPredictionRequest(PredictionRequest):
         media_path: str,
         frame_interval: float,
         max_frame_count: int,
-        general_threshold: float = 0.35,
-        character_threshold: float = 0.85,
+        general_threshold: float = DEFAULT_TAG_THRESHOLD,
+        character_threshold: float = DEFAULT_TAG_THRESHOLD,
     ):
         super().__init__(media_path, MediaType.video, general_threshold, character_threshold)
         self.frame_interval = frame_interval
@@ -123,12 +129,40 @@ def monotonic_ms_since(last: int) -> Tuple[int, int]:
 
 
 def load_labels(labels_path: str):
-    df = pd.read_csv(labels_path)
+    with open(labels_path, encoding="utf-8") as labels_file:
+        vocabulary = json.load(labels_file)
 
-    tag_names = df["name"].tolist()
-    rating_indexes = list(np.where(df["category"] == 9)[0])
-    general_indexes = list(np.where(df["category"] == 0)[0])
-    character_indexes = list(np.where(df["category"] == 4)[0])
+    tag_count = int(vocabulary["num_tags"])
+    indexed_tags = vocabulary["idx_to_tag"]
+    if isinstance(indexed_tags, dict):
+        tag_names = [indexed_tags[str(index)] for index in range(tag_count)]
+    else:
+        tag_names = list(indexed_tags)
+
+    if len(tag_names) != tag_count:
+        raise ValueError(
+            f"Vocabulary declares {tag_count} tags but contains {len(tag_names)} indexed tags"
+        )
+
+    tag_categories = vocabulary["tag_to_category"]
+    normalized_categories = [
+        str(tag_categories.get(tag, "")).casefold() for tag in tag_names
+    ]
+    rating_indexes = [
+        index
+        for index, category in enumerate(normalized_categories)
+        if category == "rating"
+    ]
+    general_indexes = [
+        index
+        for index, category in enumerate(normalized_categories)
+        if category == "general"
+    ]
+    character_indexes = [
+        index
+        for index, category in enumerate(normalized_categories)
+        if category == "character"
+    ]
     return tag_names, rating_indexes, general_indexes, character_indexes
 
 
@@ -144,19 +178,41 @@ def resolve_model_and_labels(
 ) -> Tuple[str, str]:
     if model_path:
         if os.path.isdir(model_path):
-            resolved_model_path = os.path.join(model_path, "model.onnx")
-            resolved_labels_path = os.path.join(model_path, "selected_tags.csv")
+            candidate_directories = [
+                os.path.join(model_path, MODEL_SUBDIRECTORY),
+                model_path,
+            ]
+            model_directory = next(
+                (
+                    directory
+                    for directory in candidate_directories
+                    if os.path.isfile(os.path.join(directory, MODEL_FILENAME))
+                    and os.path.isfile(os.path.join(directory, VOCABULARY_FILENAME))
+                ),
+                candidate_directories[0],
+            )
+            resolved_model_path = os.path.join(model_directory, MODEL_FILENAME)
+            resolved_labels_path = os.path.join(model_directory, VOCABULARY_FILENAME)
         else:
             resolved_model_path = model_path
             resolved_labels_path = os.path.join(
                 os.path.dirname(model_path),
-                "selected_tags.csv",
+                VOCABULARY_FILENAME,
             )
 
         if not os.path.exists(resolved_model_path):
             raise FileNotFoundError(f"Model file not found: {resolved_model_path}")
+        external_data_path = os.path.join(
+            os.path.dirname(resolved_model_path), MODEL_DATA_FILENAME
+        )
+        if not os.path.exists(external_data_path):
+            raise FileNotFoundError(
+                f"Model external data file not found: {external_data_path}"
+            )
         if not os.path.exists(resolved_labels_path):
-            raise FileNotFoundError(f"Labels file not found: {resolved_labels_path}")
+            raise FileNotFoundError(
+                f"Model vocabulary file not found: {resolved_labels_path}"
+            )
 
         return resolved_model_path, resolved_labels_path
 
@@ -168,7 +224,9 @@ def load(
     model_path: Optional[str] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[rt.InferenceSession, Tuple[Any, list]]:
-    resolved_model_path, resolved_labels_path = resolve_model_and_labels(model_uri, model_path)
+    resolved_model_path, resolved_labels_path = resolve_model_and_labels(
+        model_uri, model_path
+    )
     resolved_device = device or resolve_device()
     providers = (
         ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -181,42 +239,10 @@ def load(
     return session, labels
 
 
-def make_square(img, target_size):
-    old_size = img.shape[:2]
-    desired_size = max(old_size)
-    desired_size = max(desired_size, target_size)
-
-    delta_w = desired_size - old_size[1]
-    delta_h = desired_size - old_size[0]
-    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
-    left, right = delta_w // 2, delta_w - (delta_w // 2)
-
-    color = [255, 255, 255]
-    new_im = cv2.copyMakeBorder(
-        img,
-        top,
-        bottom,
-        left,
-        right,
-        cv2.BORDER_CONSTANT,
-        value=color,
-    )
-    return new_im
-
-
-def smart_resize(img, size):
-    # Assumes the image has already gone through make_square
-    if img.shape[0] > size:
-        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
-    elif img.shape[0] < size:
-        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_CUBIC)
-    return img
-
-
 def convert_numpy_types(obj):
-    if isinstance(obj, np.int64):
+    if isinstance(obj, np.integer):
         return int(obj)
-    if isinstance(obj, np.float32):
+    if isinstance(obj, np.floating):
         return float(obj)
     if isinstance(obj, dict):
         return {k: convert_numpy_types(v) for k, v in obj.items()}
@@ -229,50 +255,59 @@ def tag_image(
     base_image: Image.Image,
     model: rt.InferenceSession,
     labels: tuple[Any, list, list, list],
-    general_threshold: float = 0.35,
-    character_threshold: float = 0.85,
+    general_threshold: float = DEFAULT_TAG_THRESHOLD,
+    character_threshold: float = DEFAULT_TAG_THRESHOLD,
 ) -> Dict[str, Dict[str, Any]]:
     tag_names, rating_indexes, general_indexes, character_indexes = labels
-    _, height, width, _ = model.get_inputs()[0].shape
+    input_shape = model.get_inputs()[0].shape
+    if len(input_shape) != 4 or input_shape[1] != 3:
+        raise ValueError(f"Expected NCHW model input, got shape: {input_shape}")
+    _, _, height, width = input_shape
+    if not isinstance(height, int) or not isinstance(width, int):
+        raise ValueError(f"Expected fixed model input dimensions, got shape: {input_shape}")
 
     # Alpha to white
     image = base_image.convert("RGBA")
     new_image = Image.new("RGBA", image.size, "WHITE")
     new_image.paste(image, mask=image)
     image = new_image.convert("RGB")
-    np_image = np.asarray(image)
+    image = image.resize((width, height), Image.Resampling.BICUBIC)
 
-    # PIL RGB to OpenCV BGR
-    np_image = np_image[:, :, ::-1]
-
-    np_image = make_square(np_image, height)
-    np_image = smart_resize(np_image, height)
-    np_image = np_image.astype(np.float32)
+    # CL Tagger v2 uses SigLIP2 RGB preprocessing: NCHW and mean/std 0.5.
+    np_image = np.asarray(image, dtype=np.float32) / 255.0
+    np_image = (np_image - 0.5) / 0.5
+    np_image = np.transpose(np_image, (2, 0, 1))
     np_image = np.expand_dims(np_image, 0)
     input_name = model.get_inputs()[0].name
     label_name = model.get_outputs()[0].name
-    probs = model.run([label_name], {input_name: np_image})[0]
+    logits = model.run([label_name], {input_name: np_image})[0]
+    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+
+    if probs.shape[-1] != len(tag_names):
+        raise ValueError(
+            f"Model returned {probs.shape[-1]} scores for a {len(tag_names)}-tag vocabulary"
+        )
 
     labels = list(zip(tag_names, probs[0].astype(float)))
 
-    # First 4 labels are actually ratings: pick one with argmax
     ratings_names = [labels[i] for i in rating_indexes]
-    rating = dict(ratings_names)
+    rating = {
+        name.strip().replace("_", " "): score for name, score in ratings_names
+    }
 
-    # Then we have general tags: pick anywhere prediction confidence > threshold
     general_names = [labels[i] for i in general_indexes]
     general_res = {
-        k.replace("_", " "): v
-        for k, v in [x for x in general_names if x[1] > general_threshold]
+        k.strip().replace("_", " "): v
+        for k, v in [x for x in general_names if x[1] >= general_threshold]
     }
     general_res = dict(sorted(general_res.items(), key=lambda x: x[1], reverse=True))
 
-    # Everything else is characters: pick anywhere prediction confidence > threshold
     character_names = [labels[i] for i in character_indexes]
     character_res = {
-        k.replace("_", " "): v
-        for k, v in [x for x in character_names if x[1] > character_threshold]
+        k.strip().replace("_", " "): v
+        for k, v in [x for x in character_names if x[1] >= character_threshold]
     }
+    character_res = dict(sorted(character_res.items(), key=lambda x: x[1], reverse=True))
 
     return {
         "tags": convert_numpy_types(general_res),
@@ -443,7 +478,9 @@ class TaggerService:
     def predict_request(self, request: PredictionRequest) -> List[PredictionResult]:
         return list(predict(request, self.session, self.labels, self.device))
 
-    def predict_inputs(self, requests: List[PredictionRequest]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    def predict_inputs(
+        self, requests: List[PredictionRequest]
+    ) -> Dict[str, Dict[str, Dict[str, float]]]:
         predictions: Dict[str, List[PredictionResult]] = {}
         for request in requests:
             start = monotonic_ns()
@@ -459,8 +496,13 @@ class TaggerService:
 
         return {
             media_path: {
-                "rating": merge_scores([prediction_result.rating for prediction_result in result]),
+                "rating": merge_scores(
+                    [prediction_result.rating for prediction_result in result]
+                ),
                 "tags": merge_scores([prediction_result.tags for prediction_result in result]),
+                "characters": merge_scores(
+                    [prediction_result.characters for prediction_result in result]
+                ),
             }
             for media_path, result in predictions.items()
         }
