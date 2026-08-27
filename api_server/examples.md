@@ -605,7 +605,7 @@ Notes:
 
 # Tagging API
 
-The API server also supports WD14 tagger inference. The default model is `wd14-vit.v1` (SmilingWolf/wd-v1-4-vit-tagger).
+The API server supports CL Tagger v2 inference. The default and only built-in model is `cl-tagger.v2` (`cella110n/cl_tagger_v2`, stable `v2_00` weights).
 
 ## Tagging Examples
 
@@ -639,7 +639,7 @@ curl -X POST http://localhost:8000/tag \
 curl -X POST http://localhost:8000/tag \
   -H "Content-Type: application/json" \
   -d '{
-    "model_path": "/models/wd14-vit-v1",
+    "model_path": "/models/cl-tagger-v2",
     "input": ["/workspaces/ai-toolkit/cat.png"]
   }'
 ```
@@ -656,8 +656,8 @@ curl -X POST http://localhost:8000/tag \
         "media_path": "/workspaces/ai-toolkit/video.mp4",
         "frame_interval": 0.25,
         "max_frame_count": 15,
-        "general_threshold": 0.35,
-        "character_threshold": 0.85
+        "general_threshold": 0.55,
+        "character_threshold": 0.55
       }
     ]
   }'
@@ -673,7 +673,7 @@ curl -X POST http://localhost:8000/tag \
       "/workspaces/ai-toolkit/cat.png",
       {
         "media_path": "/workspaces/ai-toolkit/dog.png",
-        "general_threshold": 0.4
+        "general_threshold": 0.55
       }
     ]
   }'
@@ -693,7 +693,7 @@ curl -X GET http://localhost:8000/tag/free
 
 ```json
 {
-  "model_path": "/path/to/wd14-vit-v1",
+  "model_path": "/path/to/cl-tagger-v2",
   "input": [
     "/path/to/image.png",
     {
@@ -704,8 +704,8 @@ curl -X GET http://localhost:8000/tag/free
       "media_type": "video",
       "frame_interval": 0.25,
       "max_frame_count": 50,
-      "general_threshold": 0.35,
-      "character_threshold": 0.85
+      "general_threshold": 0.55,
+      "character_threshold": 0.55
     }
   ]
 }
@@ -720,14 +720,14 @@ curl -X GET http://localhost:8000/tag/free
 | `media_type` | string | inferred | `"image"` or `"video"`; inferred from file extension when omitted |
 | `frame_interval` | float | 0.25 | Video frame sampling interval in seconds |
 | `max_frame_count` | integer | 50 | Max frames sampled from a video |
-| `general_threshold` | float | 0.35 | Minimum confidence for general tags |
-| `character_threshold` | float | 0.85 | Minimum confidence for character tags |
+| `general_threshold` | float | 0.55 | Minimum confidence for general tags |
+| `character_threshold` | float | 0.55 | Minimum confidence for character tags |
 
 ### Request Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `model_path` | string | null | Directory containing `model.onnx` and `selected_tags.csv` (or a path to `model.onnx` with `selected_tags.csv` in the same folder) |
+| `model_path` | string | null | Extracted CL Tagger repository root (containing `v2_00/`) or a directory containing `model.onnx`, `model.onnx.data`, and `model_vocabulary.json` |
 
 ### Notes
 
@@ -735,4 +735,4 @@ curl -X GET http://localhost:8000/tag/free
 - Provide either `media_path` or `media_url`, not both.
 - When `model_path` is provided, the server loads from that location instead of downloading.
 - Video inference is supported for `.mp4`, `.webm`, `.gifv`, and `.gif` files.
-- Responses include `rating` and `tags` only, matching civitai-tagger output.
+- Responses retain the existing `result` object and include `rating`, `tags`, and `characters` for each input.
