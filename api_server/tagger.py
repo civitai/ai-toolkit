@@ -537,7 +537,10 @@ def predict(
         if device.type == "cuda"
         else ["CPUExecutionProvider"]
     )
-    model.set_providers(providers)
+    # ONNX Runtime recreates the session on every set_providers call, even when
+    # the providers are unchanged. Keep the loaded session for warm requests.
+    if model.get_providers() != providers:
+        model.set_providers(providers)
     for i, image in enumerate(images_from_data(request)):
         if i and i % 10 == 0:
             logger.info("Processing image %s", i)
@@ -618,6 +621,9 @@ class TaggerService:
         }
 
     def offload(self):
-        self.session.set_providers(["CPUExecutionProvider"])
-        self.device = torch.device("cpu")
+        providers = ["CPUExecutionProvider"]
+        if self.session.get_providers() != providers:
+            self.session.set_providers(providers)
+        # Preserve the configured inference device so the next prediction can
+        # restore CUDA once, then reuse that session for subsequent requests.
         logger.info("Tagger model '%s' offloaded to CPU", self.model_id)
