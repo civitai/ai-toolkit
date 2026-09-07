@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import torch
 from PIL import Image
 
 from api_server.tagger import (
@@ -35,10 +36,20 @@ class _Node:
 
 
 class _FakeSession:
-    def __init__(self, output, input_shape):
+    def __init__(self, output, input_shape, providers=None):
         self.output = np.asarray([output], dtype=np.float32)
         self.input_shape = input_shape
         self.received_input = None
+        self.providers = list(providers or ["CPUExecutionProvider"])
+        self.provider_changes = []
+        self.run_count = 0
+
+    def get_providers(self):
+        return list(self.providers)
+
+    def set_providers(self, providers):
+        self.providers = list(providers)
+        self.provider_changes.append(list(providers))
 
     def get_inputs(self):
         return [_Node("pixel_values", self.input_shape)]
@@ -47,6 +58,7 @@ class _FakeSession:
         return [_Node("scores")]
 
     def run(self, output_names, inputs):
+        self.run_count += 1
         self.received_input = inputs["pixel_values"]
         return [self.output]
 
@@ -249,6 +261,120 @@ class TaggerTests(unittest.TestCase):
         self.assertEqual({"1girl": 0.9}, result["tags"])
         self.assertEqual({"hatsune miku": 0.8}, result["characters"])
         self.assertEqual({"general": 0.7}, result["rating"])
+
+
+class TaggerSessionReuseTests(unittest.TestCase):
+    CUDA_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    CPU_PROVIDERS = ["CPUExecutionProvider"]
+
+    def setUp(self):
+        self.labels = (["general", "tag", "character"], [0], [1], [2])
+        self.requests = [
+            PredictionRequest.new("first.png"),
+            PredictionRequest.new("second.png"),
+        ]
+        images = patch(
+            "api_server.tagger.images_from_data",
+            return_value=[Image.new("RGB", (2, 2), "white")],
+        )
+        images.start()
+        self.addCleanup(images.stop)
+
+    def make_service(self, device, input_shape):
+        providers = self.CUDA_PROVIDERS if device == "cuda" else self.CPU_PROVIDERS
+        session = _FakeSession([0.9, 0.9, 0.9], input_shape, providers)
+        with patch("api_server.tagger.load", return_value=(session, self.labels)):
+            return TaggerService(device=torch.device(device))
+
+    def test_repeated_and_multi_image_requests_reuse_session_for_both_models(self):
+        for device in ["cpu", "cuda"]:
+            for model, shape in [("wd14", [1, 2, 2, 3]), ("cl", [1, 3, 2, 2])]:
+                with self.subTest(device=device, model=model):
+                    service = self.make_service(device, shape)
+                    expected = service.predict_inputs(self.requests)
+                    self.assertTrue(expected["first.png"]["tags"])
+
+                    for _ in range(3):
+                        self.assertEqual(expected, service.predict_inputs(self.requests))
+
+                    self.assertEqual(8, service.session.run_count)
+                    self.assertEqual([], service.session.provider_changes)
+
+    def test_offload_is_idempotent_and_next_request_restores_cuda_only_once(self):
+        service = self.make_service("cuda", [1, 3, 2, 2])
+        expected = service.predict_inputs(self.requests)
+
+        service.offload()
+        service.offload()
+
+        self.assertEqual(self.CPU_PROVIDERS, service.session.get_providers())
+        self.assertEqual([self.CPU_PROVIDERS], service.session.provider_changes)
+        self.assertEqual(torch.device("cuda"), service.device)
+        for _ in range(3):
+            self.assertEqual(expected, service.predict_inputs(self.requests))
+        self.assertEqual(self.CUDA_PROVIDERS, service.session.get_providers())
+        self.assertEqual(
+            [self.CPU_PROVIDERS, self.CUDA_PROVIDERS],
+            service.session.provider_changes,
+        )
+
+    def test_cpu_only_offload_and_predictions_do_not_recreate_session(self):
+        service = self.make_service("cpu", [1, 2, 2, 3])
+        expected = service.predict_inputs(self.requests)
+
+        service.offload()
+        service.offload()
+
+        self.assertEqual(expected, service.predict_inputs(self.requests))
+        self.assertEqual(torch.device("cpu"), service.device)
+        self.assertEqual(self.CPU_PROVIDERS, service.session.get_providers())
+        self.assertEqual([], service.session.provider_changes)
+
+    def test_changed_inference_device_reconfigures_session_only_once(self):
+        service = self.make_service("cuda", [1, 3, 2, 2])
+        service.device = torch.device("cpu")
+
+        service.predict_inputs(self.requests)
+        service.predict_inputs(self.requests)
+
+        self.assertEqual(self.CPU_PROVIDERS, service.session.get_providers())
+        self.assertEqual([self.CPU_PROVIDERS], service.session.provider_changes)
+
+    def test_api_model_switch_offloads_previous_model_and_reuses_current_model(self):
+        from api_server import app as api
+
+        sessions = [
+            _FakeSession([0.9, 0.9, 0.9], shape, self.CUDA_PROVIDERS)
+            for shape in [[1, 2, 2, 3], [1, 3, 2, 2], [1, 2, 2, 3]]
+        ]
+        with (
+            patch.object(api, "_tagger_service", None),
+            patch.object(api, "_tagger_model_path", None),
+            patch(
+                "api_server.tagger.resolve_device", return_value=torch.device("cuda")
+            ),
+            patch(
+                "api_server.tagger.load",
+                side_effect=[(session, self.labels) for session in sessions],
+            ) as load_model,
+        ):
+            previous = None
+            for index, path in enumerate(["/models/wd14", "/models/cl", "/models/wd14"]):
+                service = api._get_tagger_service(path)
+                self.assertIsNot(previous, service)
+                self.assertIs(sessions[index], service.session)
+                self.assertEqual(index + 1, load_model.call_count)
+                self.assertEqual(path, load_model.call_args.kwargs["model_path"])
+
+                self.assertIs(service, api._get_tagger_service(path))
+                expected = service.predict_inputs(self.requests)
+                self.assertEqual(expected, service.predict_inputs(self.requests))
+                self.assertEqual([], service.session.provider_changes)
+                if previous is not None:
+                    self.assertEqual(
+                        [self.CPU_PROVIDERS], previous.session.provider_changes
+                    )
+                previous = service
 
 
 if __name__ == "__main__":
