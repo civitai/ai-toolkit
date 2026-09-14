@@ -537,7 +537,10 @@ class AnimaModel(BaseModel):
         prompt = [prompt] if isinstance(prompt, str) else prompt
         return ["" if prompt_item is None else prompt_item for prompt_item in prompt]
 
+    @torch.no_grad()
     def _get_qwen_prompt_embeds(self, prompt: List[str]):
+        # Qwen is frozen. Checkpointing hooks can still enable input gradients,
+        # which must not retain a backward graph when the encoder is offloaded.
         text_inputs = self.pipeline.tokenizer(
             prompt,
             padding="longest",
