@@ -620,9 +620,12 @@ class ImageProcessingDTOMixin:
             # frame forces a keyframe seek + GOP re-decode for every extracted frame
             # (~20x slower); frames_to_extract is always ascending, so seek once to the
             # first frame then grab() through the gaps.
-            frames = []
+            frames = None
             unique_frame_idxs = sorted(set(frames_to_extract))
-            processed_frames = {}  # frame_idx -> processed frame (duplicates reuse it)
+            frame_positions = {}
+            for position, frame_idx in enumerate(frames_to_extract):
+                frame_positions.setdefault(frame_idx, []).append(position)
+            processed_frames = set()
 
             def process_frame(rgb_frame):
                 # Convert to PIL Image
@@ -650,6 +653,16 @@ class ImageProcessingDTOMixin:
                     img = transform(img)
 
                 return img
+
+            def store_frame(frame_idx, tensor):
+                nonlocal frames
+                if frames is None:
+                    frames = tensor.new_empty((len(frames_to_extract), *tensor.shape))
+                # Write directly into the final video tensor instead of keeping
+                # every frame alive alongside a second full copy from stack().
+                for position in frame_positions[frame_idx]:
+                    frames[position].copy_(tensor)
+                processed_frames.add(frame_idx)
 
             decode_with_pyav = False
 
@@ -698,7 +711,7 @@ class ImageProcessingDTOMixin:
                 # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                processed_frames[frame_idx] = process_frame(frame)
+                store_frame(frame_idx, process_frame(frame))
 
             if decode_with_pyav:
                 # cv2 could not decode this video (e.g. AV1: OpenCV's bundled ffmpeg has no
@@ -714,7 +727,7 @@ class ImageProcessingDTOMixin:
                         decoded_idx += 1
                         last_av_frame = av_frame
                         if decoded_idx in needed:
-                            processed_frames[decoded_idx] = process_frame(av_frame.to_ndarray(format='rgb24'))
+                            store_frame(decoded_idx, process_frame(av_frame.to_ndarray(format='rgb24')))
                             needed.discard(decoded_idx)
                             if not needed:
                                 break
@@ -726,16 +739,13 @@ class ImageProcessingDTOMixin:
                     # metadata frame count overshot the real stream; reuse the last decoded frame
                     tail_frame = process_frame(last_av_frame.to_ndarray(format='rgb24'))
                     for frame_idx in needed:
-                        processed_frames[frame_idx] = tail_frame
-
-            # assemble in extraction order; stretched clips repeat decoded frames
-            frames = [processed_frames[frame_idx] for frame_idx in frames_to_extract]
+                        store_frame(frame_idx, tail_frame)
 
             # Release the video capture
             cap.release()
             
-            # Stack frames into tensor [frames, channels, height, width]
-            self.tensor = torch.stack(frames)
+            # Frames are already assembled in extraction order, including repeats.
+            self.tensor = frames
 
             # ------------------------------
             # Audio extraction + stretching
