@@ -306,7 +306,8 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.requires_grad_(False)
 
     def hook_before_train_loop(self):
-        super().hook_before_train_loop()
+        if not self.is_caching_text_embeddings:
+            super().hook_before_train_loop()
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -402,6 +403,14 @@ class SDTrainer(BaseSDTrainProcess):
                     self.sd.text_encoder_to("cpu")
                 flush()
         
+        if self.is_caching_text_embeddings:
+            # Prepare the transformer only after the text encoder has been unloaded.
+            super().hook_before_train_loop()
+            if self.is_latents_cached and self.sd.vae is not None:
+                # Accelerate also moves the VAE; keep it offloaded for cached latents.
+                self.sd.vae.to('cpu')
+                flush()
+
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading
             self.cached_blank_embeds = self.sd.encode_prompt("").to(
