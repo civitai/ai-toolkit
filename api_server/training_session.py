@@ -12,6 +12,7 @@ from typing import Any, Deque, Dict, Generator, List, Optional
 from toolkit.job import get_job
 
 from api_server.epoch_controller import StepBudgetController
+from api_server.log_lines import LogLineSplitter
 
 
 class _LogTee(io.TextIOBase):
@@ -43,7 +44,7 @@ class TrainingSession:
 
         self._status_lock = threading.Lock()
         self._log_lock = threading.Lock()
-        self._log_buffer = ''
+        self._log_lines = LogLineSplitter()
         self._stopped = threading.Event()
 
         self.status: str = 'initializing'
@@ -163,16 +164,13 @@ class TrainingSession:
     def _append_log(self, chunk: str) -> None:
         if not chunk:
             return
-        chunk = chunk.replace('\r', '')
         with self._log_lock:
-            self._log_buffer += chunk
-            while '\n' in self._log_buffer:
-                line, remainder = self._log_buffer.split('\n', 1)
-                self._log_buffer = remainder
-                stripped = line.rstrip()
-                if stripped:
-                    self.log_history.append(stripped)
-                    self.log_queue.put(stripped)
+            for line, is_redraw in self._log_lines.feed(chunk):
+                # Redraws stream live but stay out of the history, which would otherwise hold nothing but
+                # progress-bar frames; the bar's final frame still lands there when a newline ends it.
+                if not is_redraw:
+                    self.log_history.append(line)
+                self.log_queue.put(line)
 
     def _on_budget_exhausted(self, completed_steps: int, epoch: int) -> None:
         with self._status_lock:
