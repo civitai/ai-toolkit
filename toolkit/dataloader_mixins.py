@@ -514,13 +514,16 @@ class ImageProcessingDTOMixin:
         vid_length_seconds = total_frames / video_fps
 
         desired_num_frames = int(vid_length_seconds * self.dataset_config.fps)
+        max_frames = self.dataset_config.max_frames
+        if max_frames is not None:
+            desired_num_frames = min(desired_num_frames, max_frames)
 
         if getattr(self, 'frame_count_snapper', None) is not None:
             # model-specific valid-frame-count grid (e.g. minimax_h3's 17n+5)
             desired_num_frames = self.frame_count_snapper(desired_num_frames)
         else:
             # make sure it is divisible by temporal_compression
-            if self.dataset_config.trim_auto_frame_count_tail:
+            if self.dataset_config.trim_auto_frame_count_tail or max_frames is not None:
                 # snap to the largest valid count that fits inside the video (after the
                 # key frame +1 below) so trim mode never overshoots the source, which
                 # would freeze the last frame and pad the audio tail with silence
@@ -531,6 +534,8 @@ class ImageProcessingDTOMixin:
             # TODO, all models currently add a key frame, but future models may not, update here if this changes.
             desired_num_frames += 1  # add one for the key frame that is always added
 
+        if max_frames is not None and desired_num_frames > max_frames:
+            raise ValueError('max_frames is below the model minimum frame count')
         return desired_num_frames
 
     def load_and_process_video(
@@ -573,12 +578,20 @@ class ImageProcessingDTOMixin:
             
             frames_to_extract = []
             
+            trim_tail = self.dataset_config.auto_frame_count and self.dataset_config.trim_auto_frame_count_tail
             if self.dataset_config.auto_frame_count:
                 self.num_frames = self.get_auto_frame_count(total_frames, video_fps)
+                if (
+                    self.dataset_config.max_frames is not None
+                    and self.dataset_config.shrink_video_to_frames
+                    and int(total_frames / video_fps * self.dataset_config.fps) > self.dataset_config.max_frames
+                ):
+                    # Only clips exceeding the cap are resampled across their full length.
+                    trim_tail = False
 
 
             # Always stretch/shrink to the requested number of frames if needed
-            if self.dataset_config.auto_frame_count and self.dataset_config.trim_auto_frame_count_tail:
+            if trim_tail:
                 # preserve real time: pull frames at the dataset fps from the start of the
                 # video and trim the tail that didn't fit the snapped frame count, instead of
                 # shrinking the whole video to fit (which speeds up motion / chipmunks audio).
@@ -798,10 +811,7 @@ class ImageProcessingDTOMixin:
                             gain = target_peak / (peak + eps)
                             waveform = waveform * gain
 
-                        trim_tail_audio = (
-                            self.dataset_config.auto_frame_count
-                            and self.dataset_config.trim_auto_frame_count_tail
-                        )
+                        trim_tail_audio = trim_tail
 
                         # Slice to the selected clip region (when we have a meaningful time range)
                         if source_duration > 0.0:
@@ -1879,6 +1889,9 @@ class LatentCachingFileItemDTOMixin:
                 # changes frame selection; only added when on so caches made before
                 # this option existed stay valid when it is off
                 item["trim_auto_frame_count_tail"] = True
+            if self.dataset_config.max_frames is not None:
+                item["max_frames"] = self.dataset_config.max_frames
+                item["shrink_video_to_frames"] = self.dataset_config.shrink_video_to_frames
             is_video = True
         elif self.is_video and self.dataset_config.num_frames > 1:
             item["num_frames"] = self.dataset_config.num_frames

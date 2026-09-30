@@ -1095,7 +1095,7 @@ class DatasetConfig:
         # if true, will shrink video to our frames. For instance, if we have a video with 100 frames and num_frames is 10,
         # we would pull frame 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 so they are evenly spaced
         self.shrink_video_to_frames: bool = kwargs.get('shrink_video_to_frames', True)
-        # fps is only used if shrink_video_to_frames is false. This will attempt to pull the num_frames at the given fps
+        # fps sets automatic frame counts and the timing of non-shrinking fixed clips.
         # it will select a random start frame and pull the frames at the given fps
         # this could have various issues with shorter videos and videos with variable fps
         # I recommend trimming your videos to the desired length and using shrink_video_to_frames(default)
@@ -1103,8 +1103,17 @@ class DatasetConfig:
         
         # auto_frame_count pull as many frames as in the video at given fps
         # Important, make sure fps for dataset is set correctly.
-        # this wont work with bucketing for now until I can handle this before bucketing.
+        # Frame counts are resolved before temporal bucketing and again at load time.
         self.auto_frame_count: bool = kwargs.get('auto_frame_count', False)
+
+        # Optional limit at dataset fps. Short clips keep their automatic frame count;
+        # longer clips shrink to this limit when shrink_video_to_frames is enabled.
+        self.max_frames: Optional[int] = kwargs.get('max_frames', None)
+        if self.max_frames is not None:
+            if type(self.max_frames) is not int or self.max_frames < 1:
+                raise ValueError('max_frames must be a positive integer')
+            if not self.auto_frame_count:
+                raise ValueError('max_frames requires auto_frame_count')
         
         #  old behavior shrank the video to fit the temporal spacing of the model. Which fits the whole video, but
         # can lead to fast motion/chipmunking. This will prevent the video from shrinking to fit, and instead, trim
