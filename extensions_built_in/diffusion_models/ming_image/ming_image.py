@@ -230,7 +230,6 @@ class MingImageModel(BaseModel):
         }
 
         network_config = NetworkConfig(type="lora", linear=dim, linear_alpha=dim, transformer_only=True)
-        LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
         network = LoRASpecialNetwork(
             text_encoder=None,
             unet=transformer,
