@@ -2533,7 +2533,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
-        if not self.train_config.resume_state_path:
+        if not self.train_config.resume_state_path or self.train_config.resume_state_mode == 'continue':
             self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
@@ -2548,8 +2548,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.train_config.resume_state_path:
             from toolkit.training_state import load_training_state
-            load_training_state(self, self.train_config.resume_state_path,
-                                self.network_config.pretrained_lora_path)
+            restored = load_training_state(self, self.train_config.resume_state_path,
+                                          self.network_config.pretrained_lora_path,
+                                          mode=self.train_config.resume_state_mode)
+            print_acc(f"Training state restored: {restored}")
 
         ###################################################################
         # TRAIN LOOP

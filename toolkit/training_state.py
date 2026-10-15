@@ -84,11 +84,16 @@ def save_training_state(trainer, checkpoint_path, step):
     return destination
 
 
-def load_training_state(trainer, state_path, checkpoint_path):
-    # Do not fall back to fresh optimization on a corrupt or incompatible resume.
+def load_training_state(trainer, state_path, checkpoint_path, mode='resume'):
+    if mode not in ('resume', 'continue'):
+        raise ValueError('Unknown training state restore mode')
+    continuing = mode == 'continue'
+    if continuing and trainer.step_num != 0:
+        raise ValueError('A new continuation must start at step zero')
+    # Corrupt or mismatched artifacts are errors, even for a new continuation.
     with zipfile.ZipFile(state_path) as archive:
         manifest = json.loads(archive.read('manifest.json'))
-        if manifest['version'] != VERSION or manifest['step'] != trainer.step_num:
+        if manifest['version'] != VERSION or (not continuing and manifest['step'] != trainer.step_num):
             raise ValueError('Training state version or step does not match the requested checkpoint')
         if manifest['checkpoint_sha256'] != file_hash(checkpoint_path):
             raise ValueError('Training state belongs to a different LoRA checkpoint')
@@ -99,20 +104,47 @@ def load_training_state(trainer, state_path, checkpoint_path):
             state = torch.load(stream, map_location='cpu', weights_only=True)
 
     optimizer = _optimizer(trainer)
-    if state['step'] != trainer.step_num or state['optimizer_type'] != _type_name(optimizer):
-        raise ValueError('Training state step or optimizer does not match the session')
-    if state['scheduler_type'] != _type_name(trainer.lr_scheduler):
+    if state['step'] != manifest['step']:
+        raise ValueError('Training state step does not match its manifest')
+    incompatible = None
+    if state['optimizer_type'] != _type_name(optimizer):
+        incompatible = 'optimizer type'
+    elif len(state['parameters']) != len(optimizer.param_groups):
+        incompatible = 'parameter groups'
+    else:
+        # Validate the entire layout before copying anything. A weights-only fallback
+        # must not leave a partially restored network or optimizer behind.
+        for group, parameters in zip(optimizer.param_groups, state['parameters'], strict=True):
+            if len(group['params']) != len(parameters) or any(
+                p.shape != saved.shape or p.dtype != saved.dtype
+                for p, saved in zip(group['params'], parameters)
+            ):
+                incompatible = 'parameter shape or precision'
+                break
+    if incompatible is not None:
+        if continuing:
+            return f'weights only (incompatible {incompatible})'
+        raise ValueError(f'Training state {incompatible} does not match the session')
+    if not continuing and state['scheduler_type'] != _type_name(trainer.lr_scheduler):
         raise ValueError('Training state scheduler does not match the session')
-    if len(state['parameters']) != len(optimizer.param_groups):
-        raise ValueError('Training state parameter groups do not match the session')
+    learning_rates = [{key: group[key] for key in ('lr', 'initial_lr') if key in group}
+                     for group in optimizer.param_groups]
     with torch.no_grad():
         for group, parameters, gradients in zip(optimizer.param_groups, state['parameters'], state['gradients'], strict=True):
             for param, saved, gradient in zip(group['params'], parameters, gradients, strict=True):
-                if param.shape != saved.shape or param.dtype != saved.dtype:
-                    raise ValueError('Training state parameter shape or precision does not match')
                 param.copy_(saved)
-                param.grad = gradient.to(param.device) if gradient is not None else None
+                param.grad = gradient.to(param.device) if gradient is not None and not continuing else None
     optimizer.load_state_dict(state['optimizer'])
+    if continuing:
+        # Preserve moments and optimizer counters, but use the new run's LR and
+        # fresh scheduler, progress, RNG, gradient accumulation and scaler.
+        for group, rates in zip(optimizer.param_groups, learning_rates, strict=True):
+            group.update(rates)
+        if trainer.ema is not None:
+            ema_state = trainer.ema.state_dict()
+            ema_state['shadow_params'] = [p.detach().clone() for group in optimizer.param_groups for p in group['params']]
+            trainer.ema.load_state_dict(ema_state)
+        return 'optimizer (new learning-rate schedule and step budget)'
     trainer.lr_scheduler.load_state_dict(state['scheduler'])
     scaler = getattr(trainer.accelerator, 'scaler', None)
     for name, target in [('scaler', scaler), ('ema', trainer.ema)]:
@@ -130,4 +162,5 @@ def load_training_state(trainer, state_path, checkpoint_path):
         if not torch.cuda.is_available():
             raise ValueError('CUDA training state requires a CUDA device')
         torch.cuda.set_rng_state(state['cuda_rng'])
+    return 'full training state'
 

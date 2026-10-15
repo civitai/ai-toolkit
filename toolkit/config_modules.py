@@ -421,6 +421,9 @@ class TrainConfig:
         self.start_step = kwargs.get('start_step', None)
         self.save_training_state = kwargs.get('save_training_state', False)
         self.resume_state_path = kwargs.get('resume_state_path', None)
+        self.resume_state_mode = kwargs.get('resume_state_mode', 'resume')
+        if self.resume_state_mode not in ('resume', 'continue'):
+            raise ValueError('resume_state_mode must be resume or continue')
         self.free_u = kwargs.get('free_u', False)
         self.adapter_assist_name_or_path: Optional[str] = kwargs.get('adapter_assist_name_or_path', None)
         self.adapter_assist_type: Optional[str] = kwargs.get('adapter_assist_type', 't2i')  # t2i, control_net
