@@ -434,6 +434,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             items = glob.glob(os.path.join(self.save_root, pattern))
             # Separate files and directories
             safetensors_files = [f for f in items if f.endswith('.safetensors')]
+            state_files = [f for f in items if f.endswith('.training-state.zip')]
+            state_files.sort(key=os.path.getctime)
+            if self.save_config.max_step_saves_to_keep > 0:
+                for state_file in state_files[:-self.save_config.max_step_saves_to_keep]:
+                    os.remove(state_file)
             pt_files = [f for f in items if f.endswith('.pt')]
             directories = [d for d in items if os.path.isdir(d) and not d.endswith('.safetensors')]
             embed_files = []
@@ -539,6 +544,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # prepare meta
         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
+        checkpoint_path = None
         if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
             if self.network is not None:
                 lora_name = self.job.name
@@ -559,6 +565,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     metadata=save_meta,
                     extra_state_dict=embedding_dict
                 )
+                checkpoint_path = file_path
                 self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
 
@@ -719,11 +726,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
-        self.clean_up_saves()
         self.post_save_hook(file_path)
 
         if self.ema is not None:
             self.ema.train()
+        if getattr(self.train_config, 'save_training_state', False):
+            from toolkit.training_state import save_training_state
+            if checkpoint_path is None:
+                raise ValueError('Portable training state requires a saved LoRA checkpoint')
+            self.last_training_state_path = save_training_state(self, checkpoint_path, self.step_num)
+        self.clean_up_saves()
         flush()
         if step is not None:
             self.last_save_step = step
@@ -2180,7 +2192,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
-        if os.path.exists(optimizer_state_file_path):
+        if os.path.exists(optimizer_state_file_path) and not self.train_config.resume_state_path:
             # try to load
             # previous param groups
             # previous_params = copy.deepcopy(optimizer.param_groups)
@@ -2531,7 +2543,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
-        self.lr_scheduler.step(self.step_num)
+        if not self.train_config.resume_state_path or self.train_config.resume_state_mode == 'continue':
+            self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()
@@ -2543,6 +2556,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # make sure all params require grad
         self.ensure_params_requires_grad(force=True)
 
+        if self.train_config.resume_state_path:
+            from toolkit.training_state import load_training_state
+            restored = load_training_state(self, self.train_config.resume_state_path,
+                                          self.network_config.pretrained_lora_path,
+                                          mode=self.train_config.resume_state_mode)
+            print_acc(f"Training state restored: {restored}")
 
         ###################################################################
         # TRAIN LOOP
