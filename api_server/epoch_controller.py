@@ -9,12 +9,15 @@ class StepBudgetController:
         self,
         total_steps: Optional[int] = None,
         on_budget_exhausted: Optional[Callable[[int, int], None]] = None,
+        initial_step: int = 0,
     ) -> None:
         self.total_steps = total_steps
         self.on_budget_exhausted = on_budget_exhausted
 
-        self.allowed_steps = 0
-        self.completed_steps = 0
+        if initial_step < 0 or (total_steps is not None and initial_step > total_steps):
+            raise ValueError('Initial step is outside the training budget')
+        self.allowed_steps = initial_step
+        self.completed_steps = initial_step
         self._last_step: Optional[int] = None
         self._last_epoch: Optional[int] = None
         self._budget_notified_at: Optional[int] = None
