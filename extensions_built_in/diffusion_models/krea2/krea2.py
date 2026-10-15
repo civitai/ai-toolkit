@@ -313,7 +313,6 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         }
 
         network_config = NetworkConfig(**network_config)
-        LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
         network = LoRASpecialNetwork(
             text_encoder=None,
             unet=transformer,
