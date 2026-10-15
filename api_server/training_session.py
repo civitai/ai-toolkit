@@ -65,13 +65,14 @@ class TrainingSession:
         self.controller = StepBudgetController(
             total_steps=max_steps,
             on_budget_exhausted=self._on_budget_exhausted,
+            initial_step=getattr(getattr(self.trainer, 'train_config', None), 'start_step', None) or 0,
         )
         if hasattr(self.trainer, 'set_pause_controller'):
             self.trainer.set_pause_controller(self.controller)
         else:
             setattr(self.trainer, 'pause_controller', self.controller)
 
-        self._last_budget_report = 0
+        self._last_budget_report = self.controller.completed_steps
 
         self._thread = threading.Thread(
             target=self._training_loop,
@@ -101,7 +102,9 @@ class TrainingSession:
                 break
             time.sleep(0.05)
         with self._status_lock:
-            if self.controller.finished_event.is_set():
+            if self.error is not None:
+                self.status = 'error'
+            elif self.controller.finished_event.is_set():
                 if self.controller.abort_event.is_set():
                     self.status = 'aborted'
                 else:
@@ -311,6 +314,8 @@ class TrainingSession:
             'error': error,
             'last_checkpoint_step': getattr(self.trainer, 'last_save_step', None),
             'last_checkpoint_path': self._latest_checkpoint_path(),
+            'training_state_version': 1,
+            'last_training_state_path': getattr(self.trainer, 'last_training_state_path', None),
         }
 
     def get_logs(self, limit: Optional[int] = None) -> List[str]:
