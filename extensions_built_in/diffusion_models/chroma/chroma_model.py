@@ -145,9 +145,13 @@ class ChromaModel(BaseModel):
             else:
                 raise ValueError(f"Model path {model_path} does not exist")
         
-        # extras_path = 'black-forest-labs/FLUX.1-schnell'
-        # schnell model is gated now, use flex instead
-        extras_path = 'ostris/Flex.1-alpha'
+        extras_path = self.model_config.extras_name_or_path
+        if extras_path == self.model_config.name_or_path:
+            extras_path = 'ostris/Flex.1-alpha'
+        chroma_extras = (
+            os.path.isdir(os.path.join(extras_path, "tokenizer"))
+            and not os.path.isdir(os.path.join(extras_path, "tokenizer_2"))
+        )
 
         self.print_and_status_update("Loading transformer")
         
@@ -168,9 +172,13 @@ class ChromaModel(BaseModel):
         flush()
 
         self.print_and_status_update("Loading T5")
-        tokenizer_2 = T5TextEncoder.load_tokenizer(extras_path)
+        tokenizer_2 = T5TextEncoder.load_tokenizer(
+            extras_path, subfolder="tokenizer" if chroma_extras else "tokenizer_2"
+        )
         text_encoder_2 = T5TextEncoder.load(
-            extras_path, **self.component_load_kwargs("te")
+            extras_path,
+            subfolder="text_encoder" if chroma_extras else "text_encoder_2",
+            **self.component_load_kwargs("te")
         )
 
         # self.print_and_status_update("Loading CLIP")
