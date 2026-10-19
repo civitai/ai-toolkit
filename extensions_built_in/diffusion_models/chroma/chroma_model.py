@@ -147,7 +147,16 @@ class ChromaModel(BaseModel):
         
         extras_path = self.model_config.extras_name_or_path
         if extras_path == self.model_config.name_or_path:
-            extras_path = 'ostris/Flex.1-alpha'
+            # Extracted Chroma repositories bundle the extras beside the weights.
+            # Only standalone checkpoints need the legacy Flex fallback.
+            model_dir = os.path.dirname(model_path)
+            if all(
+                os.path.isdir(os.path.join(model_dir, name))
+                for name in ("tokenizer", "text_encoder", "vae")
+            ):
+                extras_path = model_dir
+            else:
+                extras_path = 'ostris/Flex.1-alpha'
         chroma_extras = (
             os.path.isdir(os.path.join(extras_path, "tokenizer"))
             and not os.path.isdir(os.path.join(extras_path, "tokenizer_2"))
