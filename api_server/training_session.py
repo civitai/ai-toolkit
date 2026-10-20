@@ -314,7 +314,7 @@ class TrainingSession:
             'error': error,
             'last_checkpoint_step': getattr(self.trainer, 'last_save_step', None),
             'last_checkpoint_path': self._latest_checkpoint_path(),
-            'training_state_version': 1,
+            'training_state_version': 2,
             'last_training_state_path': getattr(self.trainer, 'last_training_state_path', None),
         }
 

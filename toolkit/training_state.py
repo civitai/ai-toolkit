@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 
-VERSION = 1
+VERSION = 2
 
 
 def file_hash(path):
@@ -42,15 +42,31 @@ def _type_name(value):
     return f'{type(value).__module__}.{type(value).__qualname__}'
 
 
+def _parameter_layout(parameters):
+    return [[{'shape': list(p.shape), 'dtype': str(p.dtype)} for p in group]
+            for group in parameters]
+
+
+def _can_restore_from_lora(trainer, parameters):
+    # EMA exports are not the live weights. Other trainable modules may not be
+    # included in the paired LoRA either. Keep their original full-state path.
+    network = trainer.network
+    if network is None or trainer.ema is not None:
+        return False
+    network_parameters = {id(p) for p in network.parameters()}
+    return all(id(p) in network_parameters for group in parameters for p in group)
+
+
 def save_training_state(trainer, checkpoint_path, step):
     optimizer = _optimizer(trainer)
+    parameters = [list(group['params']) for group in optimizer.param_groups]
     numpy_state = np.random.get_state()
     scaler = getattr(trainer.accelerator, 'scaler', None)
     state = {
         'optimizer_type': _type_name(optimizer),
         'optimizer': optimizer.state_dict(),
-        # The exported LoRA can be bf16 or EMA weights. Resume the actual training parameters.
-        'parameters': [[p.detach() for p in group['params']] for group in optimizer.param_groups],
+        # Preserve optimizer layout validation without duplicating the LoRA's weights.
+        'parameter_layout': _parameter_layout(parameters),
         'gradients': [[p.grad for p in group['params']] for group in optimizer.param_groups],
         'scheduler_type': _type_name(trainer.lr_scheduler),
         'scheduler': trainer.lr_scheduler.state_dict(),
@@ -65,6 +81,8 @@ def save_training_state(trainer, checkpoint_path, step):
         # Controller sessions use one visible GPU. Restore onto the new worker's current device.
         'cuda_rng': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }
+    if not _can_restore_from_lora(trainer, parameters):
+        state['parameters'] = parameters
     manifest = {
         'version': VERSION,
         'step': step,
@@ -93,7 +111,7 @@ def load_training_state(trainer, state_path, checkpoint_path, mode='resume'):
     # Corrupt or mismatched artifacts are errors, even for a new continuation.
     with zipfile.ZipFile(state_path) as archive:
         manifest = json.loads(archive.read('manifest.json'))
-        if manifest['version'] != VERSION or (not continuing and manifest['step'] != trainer.step_num):
+        if manifest['version'] not in (1, VERSION) or (not continuing and manifest['step'] != trainer.step_num):
             raise ValueError('Training state version or step does not match the requested checkpoint')
         if manifest['checkpoint_sha256'] != file_hash(checkpoint_path):
             raise ValueError('Training state belongs to a different LoRA checkpoint')
@@ -104,35 +122,48 @@ def load_training_state(trainer, state_path, checkpoint_path, mode='resume'):
             state = torch.load(stream, map_location='cpu', weights_only=True)
 
     optimizer = _optimizer(trainer)
+    current_parameters = [list(group['params']) for group in optimizer.param_groups]
+    parameters = state.get('parameters')
+    layout = (state['parameter_layout'] if manifest['version'] == VERSION
+              else _parameter_layout(state['parameters']))
     if state['step'] != manifest['step']:
         raise ValueError('Training state step does not match its manifest')
     incompatible = None
     if state['optimizer_type'] != _type_name(optimizer):
         incompatible = 'optimizer type'
-    elif len(state['parameters']) != len(optimizer.param_groups):
+    elif len(layout) != len(optimizer.param_groups):
         incompatible = 'parameter groups'
-    else:
-        # Validate the entire layout before copying anything. A weights-only fallback
-        # must not leave a partially restored network or optimizer behind.
-        for group, parameters in zip(optimizer.param_groups, state['parameters'], strict=True):
-            if len(group['params']) != len(parameters) or any(
-                p.shape != saved.shape or p.dtype != saved.dtype
-                for p, saved in zip(group['params'], parameters)
-            ):
-                incompatible = 'parameter shape or precision'
-                break
+    elif layout != _parameter_layout(current_parameters):
+        incompatible = 'parameter shape or precision'
+    elif parameters is None and not _can_restore_from_lora(trainer, current_parameters):
+        incompatible = 'LoRA parameter coverage'
     if incompatible is not None:
         if continuing:
             return f'weights only (incompatible {incompatible})'
         raise ValueError(f'Training state {incompatible} does not match the session')
     if not continuing and state['scheduler_type'] != _type_name(trainer.lr_scheduler):
         raise ValueError('Training state scheduler does not match the session')
+    # Check stored tensor layouts before mutating the network or optimizer.
+    if parameters is not None and _parameter_layout(parameters) != layout:
+        raise ValueError('Training state parameters do not match their layout')
+    if len(state['gradients']) != len(current_parameters) or any(
+        len(gradients) != len(group) or any(
+            gradient is not None and (gradient.shape != p.shape or gradient.dtype != p.dtype)
+            for p, gradient in zip(group, gradients)
+        ) for group, gradients in zip(current_parameters, state['gradients'])
+    ):
+        raise ValueError('Training state gradients do not match the session')
     learning_rates = [{key: group[key] for key in ('lr', 'initial_lr') if key in group}
                      for group in optimizer.param_groups]
+    if parameters is None:
+        # Reload the verified pair explicitly, never rely on a previously loaded
+        # checkpoint. FP16/BF16 export rounding is intentionally retained on resume.
+        trainer.network.load_weights(checkpoint_path)
     with torch.no_grad():
-        for group, parameters, gradients in zip(optimizer.param_groups, state['parameters'], state['gradients'], strict=True):
-            for param, saved, gradient in zip(group['params'], parameters, gradients, strict=True):
-                param.copy_(saved)
+        for index, (group, gradients) in enumerate(zip(current_parameters, state['gradients'], strict=True)):
+            for offset, (param, gradient) in enumerate(zip(group, gradients, strict=True)):
+                if parameters is not None:
+                    param.copy_(parameters[index][offset])
                 param.grad = gradient.to(param.device) if gradient is not None and not continuing else None
     optimizer.load_state_dict(state['optimizer'])
     if continuing:
@@ -162,5 +193,5 @@ def load_training_state(trainer, state_path, checkpoint_path, mode='resume'):
         if not torch.cuda.is_available():
             raise ValueError('CUDA training state requires a CUDA device')
         torch.cuda.set_rng_state(state['cuda_rng'])
-    return 'full training state'
+    return 'optimizer and training state (LoRA export weights)' if parameters is None else 'full training state'
 
