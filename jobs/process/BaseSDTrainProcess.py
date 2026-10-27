@@ -110,6 +110,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.network_config = None
         self.train_config = TrainConfig(**self.get_conf('train', {}))
+        if self.network_config is not None and self.train_config.save_training_state:
+            # Portable state is paired with one complete LoRA, including every expert.
+            self.network_config.split_multistage_loras = False
         model_config = self.get_conf('model', {})
         self.modules_being_trained: List[torch.nn.Module] = []
 
