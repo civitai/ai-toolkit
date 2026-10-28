@@ -2029,8 +2029,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # LyCORIS doesnt have default_lr
                 config = {
-                    'text_encoder_lr': self.train_config.lr,
-                    'unet_lr': self.train_config.lr,
+                    'text_encoder_lr': self.train_config.text_encoder_lr,
+                    'unet_lr': self.train_config.unet_lr,
                 }
                 sig = inspect.signature(self.network.prepare_optimizer_params)
                 if 'default_lr' in sig.parameters:
@@ -2153,8 +2153,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 params = self.sd.prepare_optimizer_params(
                     unet=self.train_config.train_unet,
                     text_encoder=self.train_config.train_text_encoder,
-                    text_encoder_lr=self.train_config.lr,
-                    unet_lr=self.train_config.lr,
+                    text_encoder_lr=self.train_config.text_encoder_lr,
+                    unet_lr=self.train_config.unet_lr,
                     default_lr=self.train_config.lr,
                     refiner=self.train_config.train_refiner and self.sd.refiner_unet is not None,
                     refiner_lr=self.train_config.refiner_lr,
