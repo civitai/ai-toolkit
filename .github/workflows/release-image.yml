@@ -1,0 +1,147 @@
+name: Publish release image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to rebuild (for example, v1.0.63)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-image-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish API image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+    steps:
+      - name: Validate release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Release tag is not a valid Docker tag: $RELEASE_TAG"
+            exit 1
+          fi
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')" = false
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$RELEASE_TAG"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Record release commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          # CUDA and Python are supplied by the image, not the host SDKs.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/boost \
+            /usr/local/share/vcpkg \
+            /usr/local/.ghcup \
+            /usr/local/julia* \
+            /usr/local/cuda* \
+            /opt/ghc \
+            /opt/az \
+            /opt/microsoft \
+            /opt/google \
+            /opt/pipx \
+            "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          docker system prune --all --force --volumes
+          df -h /
+          available_kb=$(df --output=avail / | tail -1 | tr -d ' ')
+          if (( available_kb < 50 * 1024 * 1024 )); then
+            echo "::error::The CUDA build needs at least 50 GiB free after cleanup."
+            exit 1
+          fi
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # Limit peak memory use on the public runner.
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          target: runtime
+          platforms: linux/amd64
+          # Export straight to GHCR; loading another copy can fill the runner.
+          push: true
+          load: false
+          tags: ${{ steps.release.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+
+      - name: Verify published image
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest}}')
+          test "$(jq -r '.digest' <<< "$manifest")" = "$EXPECTED_DIGEST"
+          jq -e '.manifests | any(.platform.os == "linux" and .platform.architecture == "amd64")' <<< "$manifest"
+          {
+            echo "### Published API image"
+            echo ""
+            echo "Image: \`$IMAGE\`"
+            echo ""
+            echo "Digest: \`$EXPECTED_DIGEST\`"
+            echo ""
+            echo "Source: \`$SOURCE_SHA\`"
+            echo ""
+            echo "\`docker pull $IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report disk usage
+        if: always()
+        run: df -h /
