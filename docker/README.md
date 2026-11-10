@@ -26,10 +26,10 @@ Replace `$GITHUB_TOKEN` with your GitHub Personal Access Token and `USERNAME` wi
 docker build -f docker/Dockerfile.api -t ai-toolkit-api .
 
 # Tag for GHCR
-docker tag ai-toolkit-api ghcr.io/civitai/civitai-ai-toolkit:latest
+docker tag ai-toolkit-api ghcr.io/civitai/ai-toolkit:latest
 
 # Push to registry
-docker push ghcr.io/civitai/civitai-ai-toolkit:latest
+docker push ghcr.io/civitai/ai-toolkit:latest
 ```
 
 ## Running the API Server
@@ -37,7 +37,7 @@ docker push ghcr.io/civitai/civitai-ai-toolkit:latest
 Pull and run from registry:
 
 ```bash
-docker pull ghcr.io/civitai/civitai-ai-toolkit:latest
+docker pull ghcr.io/civitai/ai-toolkit:latest
 
 docker run -d \
   --name ai-toolkit-api \
@@ -45,7 +45,7 @@ docker run -d \
   -p 8000:8000 \
   -v ./output:/app/ai-toolkit/output \
   -v ./models:/app/ai-toolkit/models \
-  ghcr.io/civitai/civitai-ai-toolkit:latest
+  ghcr.io/civitai/ai-toolkit:latest
 ```
 
 ## Managing the Container
@@ -90,11 +90,11 @@ docker ps --filter "name=ai-toolkit-api"
 Publishing a GitHub release automatically runs
 [`Publish release image`](../.github/workflows/release-image.yml). It builds
 `docker/Dockerfile.api` from the release tag and pushes the `linux/amd64` image
-to `ghcr.io/civitai/civitai-ai-toolkit` with the **exact release tag**, including
+to `ghcr.io/civitai/ai-toolkit` with the **exact release tag**, including
 the `v` prefix. For example, release `v1.0.63` produces:
 
 ```bash
-docker pull ghcr.io/civitai/civitai-ai-toolkit:v1.0.63
+docker pull ghcr.io/civitai/ai-toolkit:v1.0.63
 ```
 
 The workflow uses `GITHUB_TOKEN` with `packages: write`. For an existing GHCR
@@ -115,12 +115,12 @@ For manual versioned builds:
 
 ```bash
 # Tag with version
-docker tag ai-toolkit-api ghcr.io/civitai/civitai-ai-toolkit:v1.0.0
-docker tag ai-toolkit-api ghcr.io/civitai/civitai-ai-toolkit:latest
+docker tag ai-toolkit-api ghcr.io/civitai/ai-toolkit:v1.0.0
+docker tag ai-toolkit-api ghcr.io/civitai/ai-toolkit:latest
 
 # Push both tags
-docker push ghcr.io/civitai/civitai-ai-toolkit:v1.0.0
-docker push ghcr.io/civitai/civitai-ai-toolkit:latest
+docker push ghcr.io/civitai/ai-toolkit:v1.0.0
+docker push ghcr.io/civitai/ai-toolkit:latest
 ```
 
 ## Image Size

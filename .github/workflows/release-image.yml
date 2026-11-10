@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')" = false
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/civitai-ai-toolkit:$RELEASE_TAG"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$RELEASE_TAG"
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - name: Check out release tag
