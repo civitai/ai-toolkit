@@ -87,7 +87,31 @@ docker ps --filter "name=ai-toolkit-api"
 
 ## Versioning
 
-To create versioned releases:
+Publishing a GitHub release automatically runs
+[`Publish release image`](../.github/workflows/release-image.yml). It builds
+`docker/Dockerfile.api` from the release tag and pushes the `linux/amd64` image
+to `ghcr.io/civitai/civitai-ai-toolkit` with the **exact release tag**, including
+the `v` prefix. For example, release `v1.0.63` produces:
+
+```bash
+docker pull ghcr.io/civitai/civitai-ai-toolkit:v1.0.63
+```
+
+The workflow uses `GITHUB_TOKEN` with `packages: write`. For an existing GHCR
+package, grant the `civitai/ai-toolkit` repository write access under the
+package's **Manage Actions access** settings. Private packages still require
+authentication to pull.
+
+The public Ubuntu runner removes unused SDKs, tool caches, and Docker images
+before building. Buildx pushes directly to GHCR without loading a second image
+copy into the runner's Docker engine. The final step verifies the remote digest
+and platform and records the pull command in the workflow summary.
+
+To rebuild an already published release, run the workflow manually with its
+`tag` input. Release builds only publish the version tag; `latest` is managed
+separately.
+
+For manual versioned builds:
 
 ```bash
 # Tag with version
