@@ -409,8 +409,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # )
         o_dict['ss_output_name'] = self.job.name
 
-        if self.trigger_word is not None:
-            # just so auto1111 will pick it up
+        if self.trigger_word and 'ss_tag_frequency' not in self.meta:
+            # Fall back to the trigger for A1111 only when dataset tags are absent.
             o_dict['ss_tag_frequency'] = {
                 f"1_{self.trigger_word}": {
                     f"{self.trigger_word}": 1
