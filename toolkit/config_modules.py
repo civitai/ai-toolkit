@@ -1052,6 +1052,10 @@ class DatasetConfig:
         
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        # Opt in to larger batches only after validating the model's text encoder.
+        self.cache_text_embeddings_batch_size: int = kwargs.get('cache_text_embeddings_batch_size', 1)
+        if type(self.cache_text_embeddings_batch_size) is not int or self.cache_text_embeddings_batch_size < 1:
+            raise ValueError('cache_text_embeddings_batch_size must be a positive integer')
         self.load_image_when_caching_latents: bool = kwargs.get('load_image_when_caching_latents', False)
 
         self.standardize_images: bool = kwargs.get('standardize_images', False)

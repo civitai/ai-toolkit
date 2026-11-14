@@ -40,8 +40,6 @@ from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
 
-TEXT_EMBED_CACHE_BATCH = 16  # prompts per text-encoder forward when caching
-
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
     from toolkit.data_transfer_object.data_loader import FileItemDTO
@@ -2528,8 +2526,8 @@ class TextEmbeddingCachingMixin:
             
             did_move = False
 
-            # plain-text prompts are encoded TEXT_EMBED_CACHE_BATCH per forward: a 9B text
-            # encoder at batch 1 is kernel-launch bound (~15% GPU busy)
+            # Pooled datasets must all opt in before increasing the cache batch size.
+            cache_batch_size = min(c.cache_text_embeddings_batch_size for c in self.source_configs)
             pending = []  # (path, caption), plain text only
             pending_paths = set()
             batch_ok = [None]  # None = untested; False = legacy PromptEmbeds, no per-item split
@@ -2539,19 +2537,21 @@ class TextEmbeddingCachingMixin:
                     return
                 # similar lengths together: a batch is right-padded to its longest prompt
                 pending.sort(key=lambda t: len(t[1]))
-                size = 1 if batch_ok[0] is False else TEXT_EMBED_CACHE_BATCH
                 start = 0
                 while start < len(pending):
+                    # Check the embedding format with one caption, not an oversized probe.
+                    size = cache_batch_size if batch_ok[0] is True else 1
                     chunk = pending[start:start + size]
                     embeds = self.sd.encode_prompt([c for _, c in chunk])
                     if isinstance(embeds, AdvancedPromptEmbeds):
                         batch_ok[0] = True
                         parts = AdvancedPromptEmbeds.split_prompt_embeds(embeds, len(chunk))
                     elif len(chunk) == 1:
+                        batch_ok[0] = False
                         parts = [embeds]
                     else:
                         batch_ok[0] = False
-                        size = 1
+                        del embeds
                         continue  # redo this chunk one prompt at a time
                     for (path, _), part in zip(chunk, parts):
                         part.save(path)
@@ -2690,7 +2690,7 @@ class TextEmbeddingCachingMixin:
                             if path not in pending_paths:
                                 pending_paths.add(path)
                                 pending.append((path, caption))
-                        if len(pending) >= 4 * TEXT_EMBED_CACHE_BATCH:
+                        if len(pending) >= 4 * cache_batch_size:
                             flush_pending()
                 if getattr(file_item, 'dopsd_self_ref', False):
                     # D-OPSD teacher embeds encode with the item's own media as the reference
