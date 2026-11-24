@@ -2519,6 +2519,7 @@ class TextEmbeddingCachingMixin:
             super().__init__(**kwargs)
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
+    @torch.no_grad()
     def cache_text_embeddings(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
