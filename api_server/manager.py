@@ -44,9 +44,11 @@ class TrainingSessionManager:
         with self._lock:
             return {sid: session.get_status() for sid, session in self._sessions.items()}
 
-    def allocate_steps(self, session_id: str, steps: int, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def allocate_steps(
+        self, session_id: str, steps: int, timeout: Optional[float] = None, meta: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         session = self.get_session(session_id)
-        return session.allocate_steps(steps, timeout=timeout)
+        return session.allocate_steps(steps, timeout=timeout, meta=meta)
 
     def abort_session(self, session_id: str) -> None:
         session = self.get_session(session_id)
