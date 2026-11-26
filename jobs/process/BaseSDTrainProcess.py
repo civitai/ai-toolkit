@@ -407,7 +407,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #     is_v2=self.model_config.is_v2,
         #     is_xl=self.model_config.is_xl,
         # )
-        o_dict['ss_output_name'] = self.job.name
+        if 'ss_output_name' not in self.meta:
+            o_dict['ss_output_name'] = self.job.name
 
         if self.trigger_word and 'ss_tag_frequency' not in self.meta:
             # Fall back to the trigger for A1111 only when dataset tags are absent.

@@ -43,6 +43,7 @@ class SessionCreateRequest(BaseModel):
 class AllocateStepsRequest(BaseModel):
     steps: int = Field(..., gt=0)
     timeout: Optional[float] = None
+    meta: Optional[Dict[str, Any]] = Field(default=None, description="Metadata merged into checkpoints saved for these steps")
 
 
 class CaptionRequest(BaseModel):
@@ -201,7 +202,7 @@ def get_session(session_id: str):
 @app.post('/sessions/{session_id}/steps')
 def allocate_steps(session_id: str, request: AllocateStepsRequest = Body(...)):
     try:
-        result = manager.allocate_steps(session_id, steps=request.steps, timeout=request.timeout)
+        result = manager.allocate_steps(session_id, steps=request.steps, timeout=request.timeout, meta=request.meta)
         session = manager.get_session(session_id)
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='session not found')

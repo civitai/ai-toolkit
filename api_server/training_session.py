@@ -203,7 +203,9 @@ class TrainingSession:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def allocate_steps(self, count: int, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def allocate_steps(
+        self, count: int, timeout: Optional[float] = None, meta: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         granted = 0
         consumed = False
         timed_out = False
@@ -227,6 +229,9 @@ class TrainingSession:
                 }
             self.status = 'running'
 
+        # A reused session keeps the meta it was created with; per-epoch values arrive here.
+        if meta:
+            self.trainer.add_meta(meta)
         granted = self.controller.allow_steps(count)
         if granted == 0:
             already_finished = already_finished or self.controller.finished_event.is_set()
